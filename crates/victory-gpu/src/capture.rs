@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+pub(crate) mod stage_query;
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();

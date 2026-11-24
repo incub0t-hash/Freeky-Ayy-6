@@ -553,8 +553,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let query = crate::capture::stage_query::Query::begin(list, p, "dispatch");
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(query) = query { query.end(list) }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -605,8 +609,13 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let query = crate::pipeline::host_pipeline(self.pipeline as This)
+                        .and_then(|p| crate::capture::stage_query::Query::begin(list, p, "mesh"));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(query) = query { query.end(list) }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1068,6 +1077,8 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let query = crate::capture::stage_query::Query::begin(list, p, "indirect");
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1080,6 +1091,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(query) = query { query.end(list) }
         crate::indirect::done(list, &args.buffer, count_buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);

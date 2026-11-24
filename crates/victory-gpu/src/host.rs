@@ -334,6 +334,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) stage_queries: Mutex<Vec<crate::capture::stage_query::Query>>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -598,6 +600,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                stage_queries: Mutex::default(),
             })
         }
     }
@@ -686,6 +690,18 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if !crate::capture::stage_query::watched().is_empty() {
+            // SAFETY: the host's queue serializes this fence with the submitted lists.
+            let complete = unsafe { self.fence.GetCompletedValue() };
+            if complete >= *submitted && complete != u64::MAX {
+                for list in runs {
+                    for query in list.stage_queries.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                        query.report();
+                    }
+                }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -993,11 +1009,14 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.forget_packed_owner();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.stage_queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
