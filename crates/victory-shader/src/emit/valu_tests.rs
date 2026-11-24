@@ -122,13 +122,23 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower_test_compute(&native)
+}
+
+fn lower_test_compute(native: &NativeProgram) -> HostShader {
+    let p = ir::build_with(
+        &native.code,
+        native.wave64,
+        native.vgprs,
+        native.spills_root_args(),
+    )
+    .expect("ir::build_with");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -213,6 +223,90 @@ fn run_cases(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn compute_writes_through_spilled_root_uav() {
+    let slot = 3;
+    let [store, store_operands] = buffer_store_dword(0, 8, 4);
+    let words = [
+        0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
+        0xFA00_0000,
+        s_mov_b32(10, 0x84),  // descriptor size
+        s_mov_b32(11, 0x80),  // remaining descriptor flags
+        vop1(0x001, 0, 0x9D), // v_mov_b32 v0, 29
+        store,
+        store_operands,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 16,
+            slot,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert!(native.spills_root_args());
+    let shader = lower_test_compute(&native);
+    assert_eq!(shader.root_uavs, [slot]);
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(vec![0])),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 1,
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(4), View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out, [vec![0; 4], vec![0, 29, 0, 0]], "{label}");
+        eprintln!("{label}: root UAV write verified");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
