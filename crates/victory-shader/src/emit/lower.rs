@@ -3976,6 +3976,15 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if name.starts_with("s_load_dword") {
+                if let Some(a) = self.scalar.get(&site).copied() {
+                    if self.x.native.layout.get(a.param)
+                        .is_some_and(|p| p.root == RootType::Descriptor)
+                    {
+                        return self.root_scalar_load(inst, a);
+                    }
+                }
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -4226,6 +4235,113 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+
+    /// Read ordinary memory through a known root buffer.
+    /// The address tracker has already included the SMEM offsets.
+    fn root_scalar_load(
+        &mut self,
+        inst: &Inst,
+        a: Address,
+    ) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a root scalar load destination");
+        };
+
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a root scalar load width"),
+        };
+
+        if a.dynamic.is_some() {
+            return Err("a dynamic root scalar load offset");
+        }
+
+        if !a.offset.is_multiple_of(4) {
+            return Err("an unaligned root scalar load");
+        }
+
+        let last = a.offset.checked_add(4 * (count - 1))
+            .ok_or("a root scalar load offset overflow")?;
+
+        let rp = *self.x.native.layout.get(a.param)
+            .ok_or("a missing root scalar load parameter")?;
+
+        if rp.root != RootType::Descriptor {
+            return Err("a root scalar load from a non-buffer parameter");
+        }
+
+        let mut matching = self.x.native.used.iter()
+            .filter(|u| {
+                u.root == RootType::Descriptor
+                    && u.user_data == rp.user_data
+                    && u.slot == rp.slot
+            });
+
+        let kind = matching.next()
+            .map(|u| u.kind)
+            .ok_or("a root scalar load without a declared resource type")?;
+
+        if matching.any(|u| u.kind != kind) {
+            return Err("an ambiguous root scalar resource type");
+        }
+
+        let h = match kind {
+            ResourceType::Cbv => {
+                if last >= 65536 {
+                    return Err("a root CBV scalar load beyond 64 KiB");
+                }
+                self.s.root_cbv_handle(rp.slot)
+            }
+            ResourceType::Srv => {
+                self.s.root_srv_handle(rp.slot)
+            }
+            _ => return Err("an unsupported root scalar resource type"),
+        };
+
+        let c = self.cur;
+
+        for k in 0..count {
+            let address = self.s.m.i32(a.offset + 4 * k);
+
+            let value = if kind == ResourceType::Cbv {
+                self.cbuffer_dword(h, address)
+            } else {
+                let unused = self.s.m.undef(self.s.t.i32);
+                let mask = self.s.m.i8(1);
+                let align = self.s.m.i32(4);
+
+                let result = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, address, unused, mask, align],
+                );
+
+                let word = self.s.m.extract(c, result, 0);
+                self.as_int(word)
+            };
+
+            self.write(
+                inst,
+                Reg::S(code + k as u8),
+                value,
+                None,
+            );
+        }
+
         Ok(())
     }
 

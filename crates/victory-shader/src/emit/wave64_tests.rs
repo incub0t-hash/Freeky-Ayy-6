@@ -815,6 +815,167 @@ mod gpu {
     }
 
 
+
+    #[test]
+    fn gpu_root_scalar_load_widths() {
+        use crate::native::{ResourceType, UsedResource};
+        use crate::emit::host::Root;
+
+        let mut hardware_verified = false;
+
+        for srv in [false, true] {
+            for (opcode, count) in [
+                (0u32, 1u32),
+                (1, 2),
+                (2, 4),
+                (3, 8),
+                (4, 16),
+            ] {
+                let mut code = Vec::new();
+
+                // Root buffer at s[2:3].
+                // Load from byte 12, crossing CBV rows for wide reads.
+                code.extend_from_slice(&[
+                    0xF400_0000
+                        | (opcode << 18)
+                        | (16 << 6)
+                        | 1,
+                    (NULL_OP << 25) | 12,
+                ]);
+
+                for k in 0..count {
+                    code.push(v_mov_b32(1, 16 + k));
+
+                    code.push(v_mov_b32(2, LIT));
+                    code.push(k * 64);
+
+                    code.push(v_add_nc_u32(
+                        2, vgpr(2), 0
+                    ));
+
+                    emit_uav_store(&mut code, 1, 2);
+                }
+
+                code.push(S_ENDPGM);
+
+                let mut prog = make_cs_program(
+                    &code, [64, 1, 1], 0, false
+                );
+
+                if let StageIo::Cs(ref mut cs) = prog.io {
+                    cs.rsrc2 = (cs.rsrc2 & !(31 << 1))
+                        | (4 << 1);
+                }
+
+                prog.layout.push(RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                });
+
+                prog.used.push(UsedResource {
+                    kind: if srv {
+                        ResourceType::Srv
+                    } else {
+                        ResourceType::Cbv
+                    },
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                });
+
+                let input: Vec<u32> = (0..64)
+                    .map(|i| 0x1357_0000 | i)
+                    .collect();
+
+                let expected: Vec<u32> = (0..count)
+                    .flat_map(|k| {
+                        std::iter::repeat_n(
+                            input[(3 + k) as usize],
+                            64,
+                        )
+                    })
+                    .collect();
+
+                with_hosts(|hosts| {
+                    for (index, host) in hosts.iter().enumerate() {
+                        let Some(host) = host else {
+                            continue;
+                        };
+
+                        let mut modes = vec![Wave64Mode::Emulate];
+
+                        if host.supports_wave32() {
+                            modes.push(Wave64Mode::Wave32);
+                        }
+
+                        for mode in modes {
+                            let shader = emit_cs(&prog, mode)
+                                .expect("Scalar load translation");
+
+                            let (root, pso) = host
+                                .compute_pipeline(&shader)
+                                .expect("Scalar load pipeline");
+
+                            let result = host.dispatch(
+                                &root,
+                                &pso,
+                                &Dispatch {
+                                    roots: vec![(
+                                        1,
+                                        Root::View {
+                                            srv,
+                                            data: input.clone(),
+                                        },
+                                    )],
+                                    views: &[
+                                        View::RawUav(count * 64),
+                                    ],
+                                    samplers: &[],
+                                    groups: [1, 1, 1],
+                                },
+                            ).expect("Scalar load dispatch");
+
+                            assert_eq!(
+                                result[0],
+                                expected,
+                                "srv={srv}, count={count}, mode={mode:?}"
+                            );
+
+                            println!(
+                                "VERIFIED scalar load: srv={srv}, \
+                                width={}, mode={mode:?}, warp={}, \
+                                {} output dwords",
+                                count * 4,
+                                index == 1,
+                                expected.len(),
+                            );
+
+                            if index == 0
+                                && matches!(mode, Wave64Mode::Wave32)
+                            {
+                                hardware_verified = true;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        assert!(
+            std::env::var("VICTORY_REQUIRE_HARDWARE_TESTS")
+                .ok().as_deref() != Some("1")
+                || hardware_verified
+        );
+    }
+
     #[test]
     fn gpu_lds_packed_subword_writes() {
         for (half, high, byte_offset) in [
