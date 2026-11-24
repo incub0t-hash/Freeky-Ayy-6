@@ -822,6 +822,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    title_write_epoch: u64,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1480,6 +1481,10 @@ impl HostList {
         }
     }
 
+    pub(crate) fn title_write_epoch(&self) -> u64 {
+        self.deferred().title_write_epoch
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1491,6 +1496,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.title_write_epoch += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1618,8 +1624,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.title_write_epoch += 1;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

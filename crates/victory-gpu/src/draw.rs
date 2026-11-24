@@ -73,7 +73,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: std::collections::HashMap<FreshTableKey, u32>,
     /// The dynamic slots the list holds (title heap, first, count), given
     /// back when the list is reset or released, or earlier when a heap runs
     /// short after the list ran (see [`crate::descriptor::lease`]).
@@ -766,16 +766,13 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
+            let (key, views) = unsafe {
+                capture_fresh_table(
+                    host.heap.as_raw() as usize,
+                    list.title_write_epoch(),
+                    table,
+                    n,
+                )
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -796,16 +793,18 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let mut complete = true;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match views[k as usize].clone() {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
+                            complete = false;
+                            self.table_failed = true;
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
@@ -825,7 +824,10 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            if complete {
+                self.fresh_tables.insert(key, first);
+                made.push((slot, first * 32));
+            }
         }
         made
     }
@@ -1372,5 +1374,123 @@ mod tests {
         let mut last = State::default();
         assert_eq!(last.take_dynamic(&heap, key, total), None);
         assert!(!reset.lease().is_lost());
+    }
+}
+
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FreshTableKey {
+    heap: usize,
+    epoch: u64,
+    records: Vec<Option<[u32; 3]>>,
+}
+
+/// Caller supplies a readable table of n descriptor records.
+unsafe fn capture_fresh_table(
+    heap: usize,
+    epoch: u64,
+    table: u64,
+    n: u32,
+) -> (FreshTableKey, Vec<Option<View>>) {
+    let mut records = Vec::with_capacity(n as usize);
+    let mut views = Vec::with_capacity(n as usize);
+
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        let record = unsafe {
+            (at as *const [u32; 3]).read_unaligned()
+        };
+        let view = crate::descriptor::view_from_record(record);
+
+        records.push(view.as_ref().map(|_| record));
+        views.push(view);
+    }
+
+    (FreshTableKey { heap, epoch, records }, views)
+}
+
+#[cfg(test)]
+mod exact_table_cache_regression {
+    use super::*;
+
+    #[test]
+    fn copied_tables_share_identity_but_changes_do_not() {
+        let mut a = [0u32; 8];
+        let mut b = [0u32; 8];
+
+        let pa = a.as_mut_ptr() as u64;
+        let pb = b.as_mut_ptr() as u64;
+
+        let desc = [0x1000u32, 0, 256, 0];
+
+        crate::descriptor::create_cbv(
+            std::ptr::null(), &desc, pa
+        );
+
+        b.copy_from_slice(&a);
+
+        let (ka, _) = unsafe {
+            capture_fresh_table(1, 0, pa, 1)
+        };
+        let (kb, _) = unsafe {
+            capture_fresh_table(1, 0, pb, 1)
+        };
+
+        assert_eq!(ka, kb);
+
+        let (other_heap, _) = unsafe {
+            capture_fresh_table(2, 0, pb, 1)
+        };
+        assert_ne!(ka, other_heap);
+
+        let (after_write, _) = unsafe {
+            capture_fresh_table(1, 1, pb, 1)
+        };
+        assert_ne!(ka, after_write);
+
+        let changed = [0x2000u32, 0, 256, 0];
+
+        crate::descriptor::create_cbv(
+            std::ptr::null(), &changed, pb
+        );
+
+        let (kc, _) = unsafe {
+            capture_fresh_table(1, 0, pb, 1)
+        };
+
+        assert_ne!(ka, kc);
+    }
+
+    #[test]
+    fn deferred_writes_change_the_snapshot_epoch() {
+        let host = crate::host::host().expect("Host device");
+        let list = host.new_list().expect("Command list");
+
+        let source = [1u8];
+        let mut destination = [0u8];
+
+        assert_eq!(list.title_write_epoch(), 0);
+
+        list.defer_fill(
+            destination.as_mut_ptr(),
+            source.as_ptr(),
+            1,
+        );
+
+        assert_eq!(list.title_write_epoch(), 0);
+
+        list.defer_copy(
+            destination.as_mut_ptr(),
+            source.as_ptr(),
+            1,
+        );
+
+        assert_eq!(list.title_write_epoch(), 1);
+
+        list.defer(|| {});
+
+        assert_eq!(list.title_write_epoch(), 2);
+
+        // Recording only; no commands are submitted.
     }
 }

@@ -421,7 +421,11 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    view_from_record(record)
+}
+
+pub(crate) fn view_from_record([tag, i, generation]: [u32; 3]) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
