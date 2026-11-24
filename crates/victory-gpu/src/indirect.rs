@@ -148,7 +148,24 @@ pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
+    arguments: (u32, u32, u32),
+) -> bool {
+    bound_from(
+        list,
+        buffer,
+        gpu,
+        arguments,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )
+}
+
+/// Clamp arguments from an explicitly known resource state.
+pub(crate) fn bound_from(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    before: D3D12_RESOURCE_STATES,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -162,6 +179,14 @@ pub(crate) fn bound(
     // the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
+        if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            l.ResourceBarrier(&[transition(
+                buffer,
+                before,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -309,5 +334,72 @@ mod buffer_state_regression {
             assert_eq!(&actual[..4], &expected);
             assert_eq!(&actual[4..], &expected);
         }
+    }
+}
+
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod prior_read_regression {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn indirect_after_prior_read() {
+        let host = host().expect("D3D12 device required");
+
+        let _: ID3D12InfoQueue = host.device.cast()
+            .expect("Enable D3D12 debug layer");
+
+        let (args, data) = host.shared_buffer(256)
+            .expect("Argument allocation");
+
+        let (output, _) = host.shared_buffer(256)
+            .expect("Output allocation");
+
+        let expected = [3u32, 1, 0, 0];
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr(),
+                data.cast::<u32>(),
+                expected.len(),
+            );
+        }
+
+        let list = host.new_list().expect("Command list");
+
+        let _ = host.log_messages();
+
+        // Establish a prior read of the argument buffer.
+        unsafe {
+            list.list.CopyBufferRegion(
+                &output, 0, &args, 0, 16
+            );
+        }
+
+        // Attempt to reuse the same resource for UAV writes.
+        assert!(bound_from(
+            &list,
+            &args,
+            unsafe { args.GetGPUVirtualAddress() },
+            (0, 16, 1),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ));
+
+        done(&list, &args);
+
+        let closed = unsafe { list.list.Close() };
+        let messages = host.log_messages();
+
+        assert_eq!(
+            messages,
+            None,
+            "Read-to-UAV resource-state conflict"
+        );
+
+        closed.expect("Close command list");
+
+        // Recording-only regression:
+        // deliberately do not submit potentially invalid commands.
     }
 }
