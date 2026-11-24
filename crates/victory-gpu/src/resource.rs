@@ -1189,6 +1189,15 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 pub(crate) struct TargetRef(pub(crate) This);
 
 #[cfg(windows)]
+impl TargetRef {
+    /// The caller holds TARGETS_AT until the counted reference is acquired.
+    fn acquire(target: usize) -> Option<Self> {
+        let target = target as This;
+        object::try_add_ref(target).then(|| Self(target))
+    }
+}
+
+#[cfg(windows)]
 impl Drop for TargetRef {
     fn drop(&mut self) {
         resource_release(self.0);
@@ -1241,8 +1250,9 @@ pub(crate) fn alias_of(this: This) -> Option<TargetRef> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
+    let other = TargetRef::acquire(*targets.get(&(r.data() as u64))?)?;
+    drop(targets);
+    let o = resource(other.0);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
         && o.desc.dimension == r.desc.dimension
@@ -1253,7 +1263,7 @@ pub(crate) fn alias_of(this: This) -> Option<TargetRef> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    (same && object::try_add_ref(other)).then(|| TargetRef(other))
+    same.then_some(other)
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2196,8 +2206,9 @@ pub(crate) fn uav_texture_at(
     {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&other) = targets.get(&address) {
-            let other = other as This;
-            let o = &resource(other).desc;
+            let lease = TargetRef::acquire(other)?;
+            drop(targets);
+            let o = &resource(lease.0).desc;
             if o.dimension != d.dimension
                 || o.width != d.width
                 || o.height != d.height
@@ -2208,11 +2219,10 @@ pub(crate) fn uav_texture_at(
                 || o.flags & 6 != 4
                 || o.layout != d.layout
                 || !permits(target_format(pc_format(o.format)))
-                || !object::try_add_ref(other)
             {
                 return None;
             }
-            return Some(TargetRef(other));
+            return Some(lease);
         }
     }
     let mut r = *desc;
