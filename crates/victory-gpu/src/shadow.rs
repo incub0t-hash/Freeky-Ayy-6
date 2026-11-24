@@ -179,11 +179,10 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
-/// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// Signature storage for a padded GPU allocation, including the additional
+/// piece required when its guest start is not on a 64 KiB boundary.
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    crate::host::CardHash::selected().signature_bytes(size / PIECE as u64 + 2)
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -256,7 +255,11 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
-    if most == 0 || !cards() {
+    // Keep the cooperative shader's index arithmetic in the same range
+    // as named card buffers, including the skew of the last piece.
+    if most == 0 || !cards()
+        || (size >= 1 << 30 && crate::host::CardHash::selected() == crate::host::CardHash::Cooperative)
+    {
         return None;
     }
     let host = host()?;
@@ -2482,12 +2485,16 @@ impl Shadow {
         }
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
+    /// CPU staging, optional GPU signatures and the source extent to hash.
+    /// The cooperative kernel masks the logical tail of the guest allocation.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        let extent = match crate::host::CardHash::selected() {
+            crate::host::CardHash::Cooperative => self.len,
+            crate::host::CardHash::Serial => card.size,
+        };
+        Some((&card.staging, before, extent))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
