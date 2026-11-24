@@ -661,9 +661,26 @@ pub(crate) fn direct_raw_window(view: &View) -> Option<ScalarWindow> {
     raw_window(base.checked_add(first)?, len)
 }
 
+/// A root SRV has no descriptor length. Its complete dwords stop at the
+/// end of the live guest buffer, even if the host allocation has padding.
+pub(crate) fn root_raw_window(address: u64) -> Option<ScalarWindow> {
+    if address == 0 { return None; }
+    let shadow = crate::shadow::find_named(address, 4)?;
+    let len = shadow.left(address) / 4 * 4;
+    named_raw_window(shadow, address, len)
+}
+
 fn raw_window(address: u64, len: u64) -> Option<ScalarWindow> {
-    let elements = u32::try_from(len / 4).ok()?;
     let shadow = crate::shadow::find_named(address, len)?;
+    named_raw_window(shadow, address, len)
+}
+
+fn named_raw_window(
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+) -> Option<ScalarWindow> {
+    let elements = u32::try_from(len / 4).ok()?;
     let offset = shadow.offset(address);
     if !offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         return None;

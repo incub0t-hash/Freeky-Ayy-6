@@ -476,58 +476,49 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
+            for &slot in &t.root_cbvs {
+                stage.root_cbvs.push((slot, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+            // Public #493 uses a one-view table to keep root fetches inside
+            // the live buffer. Root UAVs use the same bounded table layout.
+            for (inputs, kind, slots) in [
+                (&t.root_srvs, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, &mut stage.root_srvs),
+                (&t.root_uavs, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, &mut stage.root_uavs),
             ] {
-                for &slot in slots {
-                    out.push((slot, params.len() as u32));
+                for &slot in inputs {
+                    ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                        RangeType: kind,
+                        NumDescriptors: 1,
+                        BaseShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                        OffsetInDescriptorsFromTableStart: 0,
+                    }));
+                    let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                    slots.push((slot, params.len() as u32));
                     params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: 1,
+                                pDescriptorRanges: range,
                             },
                         },
                         ShaderVisibility: visibility,
                     });
                 }
-            }
-            for &slot in &t.root_uavs {
-                // A one-view table, as a bounded root SRV: the view's size
-                // bounds what the shader writes, which a root descriptor
-                // leaves unbounded.
-                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                    NumDescriptors: 1,
-                    BaseShaderRegister: u32::from(slot),
-                    RegisterSpace: ROOT_CBV_SPACE,
-                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                    OffsetInDescriptorsFromTableStart: 0,
-                }));
-                let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                stage.root_uavs.push((slot, params.len() as u32));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                            NumDescriptorRanges: 1,
-                            pDescriptorRanges: range,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {

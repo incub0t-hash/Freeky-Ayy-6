@@ -349,6 +349,114 @@ fn scene_raw_window(direct: bool) {
 }
 
 #[test]
+fn bounded_root_srv_stops_mesh_fetch_at_the_recorded_allocation_end() {
+    use crate::{descriptor, shadow};
+    const BYTES: usize = 0xddc00;
+    let host = host().expect("GPU required");
+    let dev = &host.device;
+    let mut guest = vec![0u32; 4 + BYTES / 4 + 2];
+    let base = guest.as_ptr() as u64;
+    let owner = base as usize;
+    let address = base + 16;
+    // Three residual bytes cannot be exposed as another raw dword. The host
+    // buffer is rounded up and adjacent guest memory contains a sentinel.
+    shadow::register(owner, base, 16 + BYTES as u64 + 3);
+    guest[4] = 0x11223344;
+    guest[3 + BYTES / 4] = 0xaabbccdd;
+    guest[4 + BYTES / 4] = 0xdeadbeef;
+    let source = compile(
+        r#"
+        ByteAddressBuffer scene : register(t3);
+        RWByteAddressBuffer result : register(u0);
+        [RootSignature("DescriptorTable(SRV(t3)), UAV(u0)")][numthreads(1,1,1)]
+        void main() {
+            uint size; scene.GetDimensions(size);
+            result.Store4(0, uint4(size, scene.Load(0), scene.Load(0xddbfc), scene.Load(0xddc00)));
+        }
+    "#,
+        s!("cs_5_1"),
+    );
+    let null = std::ptr::null();
+    let mut guest_heap = null;
+    let desc = [0u32, 8, 1, 0, 0, 0, 0, 0];
+    assert_eq!(
+        descriptor::create_heap(
+            null,
+            desc.as_ptr().cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut guest_heap
+        ),
+        crate::object::S_OK
+    );
+    let heap = descriptor::heap(guest_heap).host().unwrap();
+    unsafe {
+        let root: ID3D12RootSignature = dev.CreateRootSignature(0, &source).unwrap();
+        let pipe: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: shader(&source),
+                ..Default::default()
+            })
+            .unwrap();
+        let (out, mapped) = host.shared_buffer(16).unwrap();
+        for (pass, requested) in [
+            Some(address),
+            Some(address),
+            Some(address + 4),
+            None,
+            Some(base + 0x400000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            std::ptr::write_bytes(mapped, 0x5a, 16);
+            let list = host.new_list().unwrap();
+            let mut state = super::State::default();
+            state.set_heaps(&[guest_heap]);
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pipe);
+            assert!(state.root_srv_table(&list, requested, 0, true));
+            let n = state.dynamic.len();
+            assert!(state.root_srv_table(&list, requested, 0, true));
+            assert_eq!(n, state.dynamic.len());
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+            list.close();
+            match pass {
+                0 => guest[4] = 0x55667788,
+                1 => {
+                    shadow::unregister(owner, base);
+                    shadow::register(owner, base, 16 + BYTES as u64 + 3);
+                    guest[4] = 0xfeedbeef;
+                    guest[3 + BYTES / 4] = 0xbad0cafe;
+                }
+                _ => {}
+            }
+            host.execute(&[&list]);
+            let actual = mapped.cast::<[u32; 4]>().read_volatile();
+            if pass < 2 {
+                assert_eq!(
+                    actual,
+                    [BYTES as u32, 0x55667788, 0xaabbccdd, 0],
+                    "pass {pass}"
+                );
+            } else {
+                // Null raw descriptors return zero for every memory load.
+                assert_eq!(&actual[1..], &[0, 0, 0], "pass {pass}");
+            }
+            dev.GetDeviceRemovedReason().unwrap();
+            assert_eq!(host.log_messages(), None, "D3D12 validation on pass {pass}");
+        }
+    }
+    shadow::unregister(owner, base);
+    crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(guest_heap, 16)(
+        guest_heap,
+    );
+}
+
+#[test]
 fn gpu_generated_draws_reach_depth_tested_framebuffer() {
     indirect_framebuffer(None);
 }
