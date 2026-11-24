@@ -175,7 +175,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<LoadedHandleKey, V>,
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: the raw slot, the stride and the bias.
     entries: HashMap<(usize, Site, u8), [V; 3]>,
@@ -4590,7 +4590,9 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = loaded_handle_key(
+                    self.cur, *load, *first, sampler, props
+                );
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -8895,5 +8897,65 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+}
+
+
+/// Include the entire DXIL resource annotation in cache identity.
+type LoadedHandleKey = (usize, Site, u8, bool, (u32, u32));
+
+fn loaded_handle_key(
+    block: usize,
+    load: Site,
+    first: u8,
+    sampler: bool,
+    props: (u32, u32),
+) -> LoadedHandleKey {
+    (block, load, first, sampler, props)
+}
+
+#[cfg(test)]
+mod handle_identity_regression {
+    use super::*;
+
+    #[test]
+    fn different_resource_annotations_never_share_a_handle() {
+        let mut cache = HashMap::new();
+
+        for props in [
+            (12, 4),
+            (12, 8),
+            (12, 16),
+            (12, 32),
+            (13, 256),
+            (13, 65536),
+        ] {
+            let key = loaded_handle_key(
+                0, (0, 1), 0, false, props
+            );
+
+            assert!(cache.insert(key, props).is_none());
+        }
+
+        assert_eq!(cache.len(), 6);
+
+        let key = loaded_handle_key(
+            0, (0, 1), 0, false, (12, 16)
+        );
+
+        assert_eq!(cache.get(&key), Some(&(12, 16)));
+    }
+
+    #[test]
+    fn identical_annotations_reuse_the_same_identity() {
+        let a = loaded_handle_key(
+            2, (1, 3), 0, false, (12, 16)
+        );
+
+        let b = loaded_handle_key(
+            2, (1, 3), 0, false, (12, 16)
+        );
+
+        assert_eq!(a, b);
     }
 }
