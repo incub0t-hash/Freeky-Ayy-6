@@ -345,28 +345,35 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = contiguous_dynamic_fit(
+            taken, *next as usize, n
+        ) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
+
             ONCE.call_once(|| {
-                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+                let mut free = 0usize;
+                let mut longest = 0usize;
+                let mut run = 0usize;
+
+                for &occupied in taken.iter() {
+                    if occupied {
+                        run = 0;
+                    } else {
+                        free += 1;
+                        run += 1;
+                        longest = longest.max(run);
+                    }
+                }
+
+                tracing::warn!(
+                    requested = n,
+                    capacity = taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
             });
+
             return None;
         };
         taken[first..first + n].fill(true);
@@ -1502,6 +1509,108 @@ mod retirement_regression {
             heap.dynamic(1),
             Some(first),
             "Retired slot was not returned to the allocator"
+        );
+    }
+}
+
+
+/// Find a physically contiguous allocation in next-fit order.
+/// The cursor orders candidates, not the extent of a table.
+fn contiguous_dynamic_fit(
+    occupied: &[bool],
+    cursor: usize,
+    count: usize,
+) -> Option<usize> {
+    if count == 0 || count > occupied.len() {
+        return None;
+    }
+
+    let end = occupied.len() - count + 1;
+    let split = cursor.min(end);
+
+    for (start, stop) in [(split, end), (0, split)] {
+        let mut candidate = start;
+
+        while candidate < stop {
+            let blocked = occupied[candidate..candidate + count]
+                .iter()
+                .rposition(|&used| used);
+
+            match blocked {
+                None => return Some(candidate),
+                Some(offset) => candidate += offset + 1,
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod allocation_search_regression {
+    use super::*;
+
+    #[test]
+    fn exhaustive_next_fit_correctness() {
+        for mask in 0u16..256 {
+            let occupied: [bool; 8] =
+                std::array::from_fn(|i| mask & (1 << i) != 0);
+
+            for cursor in 0..8 {
+                for count in 1..=8 {
+                    let expected = (0..8)
+                        .map(|i| (cursor + i) % 8)
+                        .find(|&i| {
+                            i + count <= 8
+                                && occupied[i..i + count]
+                                    .iter().all(|&v| !v)
+                        });
+
+                    assert_eq!(
+                        contiguous_dynamic_fit(
+                            &occupied, cursor, count
+                        ),
+                        expected,
+                        "mask={mask} cursor={cursor} count={count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocator_uses_free_region_across_cursor() {
+        let heap = HostHeap::new(false, 8)
+            .expect("Host heap");
+
+        {
+            let mut guard = heap.next.lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            guard.1.fill(true);
+            guard.1[..9].fill(false);
+            guard.0 = 4;
+        }
+
+        assert_eq!(
+            heap.dynamic(9),
+            Some(heap.count),
+            "A valid contiguous allocation was rejected"
+        );
+
+        assert!(heap.dynamic(1).is_none());
+    }
+
+    #[test]
+    fn tables_cannot_wrap_the_physical_heap() {
+        let occupied = [
+            false, false, true, true,
+            true, true, false, false
+        ];
+
+        assert_eq!(
+            contiguous_dynamic_fit(&occupied, 6, 4),
+            None
         );
     }
 }
