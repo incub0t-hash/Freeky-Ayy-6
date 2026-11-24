@@ -151,6 +151,10 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Bit lost by the native view-index shift, reserved only for a verified
+/// scalar-only selector whose concrete view is a raw buffer SRV.
+pub const SCALAR_RAW_INDEX: u32 = 1 << 31;
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -165,6 +169,8 @@ pub struct HostShader {
     pub scalar_raw_srvs: Vec<(u8, u32)>,
     /// User-data indices used only to select a raw compute SRV from the view heap.
     pub direct_raw_indices: Vec<u32>,
+    /// Root indices whose scalar loads choose the SRV or CBV operation from the bound view.
+    pub direct_scalar_indices: Vec<u32>,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -431,6 +437,7 @@ fn emit_prepared(
         record_stride: l.record_stride,
         scalar_raw_srvs: scalar_srvs::entries(native, p, res),
         direct_raw_indices: scalar_srvs::direct_indices(native, p, res),
+        direct_scalar_indices: l.direct_scalar_indices,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -704,6 +711,7 @@ mod tests {
             record_stride: None,
             scalar_raw_srvs: Vec::new(),
             direct_raw_indices: Vec::new(),
+            direct_scalar_indices: Vec::new(),
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -718,6 +726,7 @@ mod tests {
                 record_stride: None,
                 scalar_raw_srvs: Vec::new(),
                 direct_raw_indices: Vec::new(),
+                direct_scalar_indices: Vec::new(),
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),

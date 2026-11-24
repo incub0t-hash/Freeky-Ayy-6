@@ -587,33 +587,67 @@ pub(crate) fn scalar_window(view: &View, stride: u32) -> Option<ScalarWindow> {
 /// Make only the selected direct buffer view. Validate the guest allocation
 /// and its declared element window before obtaining the canonical GPU shadow.
 pub(crate) fn direct_raw_window(view: &View) -> Option<ScalarWindow> {
+    direct_buffer_window(view, false)
+}
+
+pub(crate) fn direct_scalar_window(view: &View) -> Option<ScalarWindow> {
+    direct_buffer_window(view, true)
+}
+
+fn direct_buffer_window(view: &View, allow_structured: bool) -> Option<ScalarWindow> {
     let (base, width, words): (u64, u64, &[u32; 10]) = match view {
         View::Shader(r, Some(words)) => {
             let (base, width) = crate::resource::buffer_bytes(*r as crate::object::This)?;
             (base as u64, width, words)
         }
-        View::Placed(false, resource, words) if resource[0] == 1 && resource[12] & 4 == 0 =>
-            (u64::from(words[10]) | u64::from(words[11]) << 32,
-             u64::from(resource[4]) | u64::from(resource[5]) << 32, words[..10].try_into().ok()?),
+        View::Placed(false, resource, words) if resource[0] == 1 && resource[12] & 4 == 0 => (
+            u64::from(words[10]) | u64::from(words[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            words[..10].try_into().ok()?,
+        ),
         _ => return None,
     };
-    if words[0] != DXGI_FORMAT_R32_TYPELESS.0 as u32 || words[1] != 1
-        || words[7] != 0 || words[8] != D3D12_BUFFER_SRV_FLAG_RAW.0 as u32
-        || base == 0 || words[2] != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
+    if words[1] != 1 || base == 0 || words[2] != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         return None;
     }
+    let stride = if words[0] == DXGI_FORMAT_R32_TYPELESS.0 as u32
+        && words[7] == 0
+        && words[8] == D3D12_BUFFER_SRV_FLAG_RAW.0 as u32
+    {
+        4
+    } else if allow_structured
+        && words[0] == 0
+        && (4..=2048).contains(&words[7])
+        && words[7].is_multiple_of(4)
+        && words[8] == 0
+    {
+        u64::from(words[7])
+    } else {
+        return None;
+    };
     let desc = srv_desc(words);
     // SAFETY: D3D12_SRV_DIMENSION_BUFFER was checked above.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    let first = buffer.FirstElement.checked_mul(4)?;
-    let len = u64::from(buffer.NumElements) * 4;
-    if len == 0 || first.checked_add(len)? > width { return None; }
+    let first = buffer.FirstElement.checked_mul(stride)?;
+    let len = u64::from(buffer.NumElements) * stride;
+    if len == 0 || first.checked_add(len)? > width {
+        return None;
+    }
     raw_window(base.checked_add(first)?, len)
 }
 
 fn raw_window(address: u64, len: u64) -> Option<ScalarWindow> {
-    let elements = u32::try_from(len / 4).ok()?;
     let shadow = crate::shadow::find_named(address, len)?;
+    raw_window_on(shadow, address, len)
+}
+
+/// Use the generation already selected by the descriptor binder.
+pub(crate) fn raw_window_on(
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+) -> Option<ScalarWindow> {
+    let elements = u32::try_from(len / 4).ok()?;
     let offset = shadow.offset(address);
     if !offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         return None;

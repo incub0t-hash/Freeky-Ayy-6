@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     pub mesh_lane_independent: bool,
     pub record_stride: Option<UserData>,
+    pub direct_scalar_indices: Vec<u32>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -222,6 +223,7 @@ struct Lower<'a> {
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     heap_raw_loads: std::collections::BTreeSet<Site>,
+    scalar_selections: BTreeMap<Site, (u32, Value)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -1051,6 +1053,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             heap_raw_loads: super::scalar_srvs::heap_raw_loads(x.native, x.p, x.res),
+            scalar_selections: super::scalar_srvs::scalar_selections(x.native, x.p, x.res),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1618,6 +1621,9 @@ impl<'a> Lower<'a> {
             mesh_lane_independent: (self.mesh_lane_independent || self.mesh_allocation.is_some())
                 && self.s.flags & flags::WAVE_OPS == 0,
             record_stride,
+            direct_scalar_indices: self.scalar_selections.values().map(|s| s.0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter().collect(),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -3772,23 +3778,44 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // As in fxceless/victory-gta6, choose the descriptor operation from
+        // the actual heap kind. The binder supplies it only for the selected
+        // root index whose other uses cannot observe the upper five bits.
+        if let Some(&(_, selector)) = self.scalar_selections.get(&site) {
+            let selected = self.i32_of(selector)?;
+            let zero = self.s.m.i32(0);
+            let raw = self.s.m.cmp(c, pred::SLT, selected, zero);
+            let inside = self.begin_guarded(Some(raw));
+            let h = self.handle(site, src, false, (11, 0))?;
+            let mut words = Vec::new();
+            for k in 0..count {
+                let off = self.s.m.i32(4 * k);
+                let at = self.s.m.bin(self.cur, Bin::Add, addr, off);
+                let x = self.raw_dword(h, at);
+                words.push((x, zero));
+            }
+            let result = self.end_guarded(inside, &words);
+            let cbv = self.s.m.cmp(self.cur, pred::SGE, selected, zero);
+            let inside = self.begin_guarded(Some(cbv));
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let mut words = Vec::new();
+            for (k, &raw_word) in result.iter().enumerate() {
+                let off = self.s.m.i32(4 * k as u32);
+                let at = self.s.m.bin(self.cur, Bin::Add, addr, off);
+                let x = self.cbuffer_dword(h, at);
+                words.push((x, raw_word));
+            }
+            for (k, x) in self.end_guarded(inside, &words).into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         if self.heap_raw_loads.contains(&site) || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+                let x = self.raw_dword(h, a);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -4015,6 +4042,22 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    fn raw_dword(&mut self, h: V, at: V) -> V {
+        let mask = self.s.m.i8(1);
+        let offset = self.s.m.undef(self.s.t.i32);
+        let align = self.s.m.i32(4);
+        let row = self.s.op(
+            self.cur,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, offset, mask, align],
+        );
+        let bits = self.s.m.extract(self.cur, row, 0);
+        self.as_int(bits)
     }
 
     /// The dword at a computed byte address of a constant buffer.
