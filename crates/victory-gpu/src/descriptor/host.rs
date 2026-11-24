@@ -329,11 +329,31 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+
+        let Some(end) = at.checked_add(n) else {
+            return;
+        };
+
+        if n == 0 || end > self.dynamic {
+            return;
         }
+
+        let mut guard = self.next.lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let Some(slots) =
+            guard.1.get_mut(at as usize..end as usize)
+        else {
+            return;
+        };
+
+        // Keep the allocator locked until cleanup finishes.
+        // A new recorder must not acquire a slot during retirement.
+        for index in first..first + n {
+            self.make_null(index);
+        }
+
+        slots.fill(false);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1587,6 +1607,49 @@ void main() {
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
+
+    #[test]
+    fn retired_dynamic_slots_release_resource_references() {
+        let host = host().expect("D3D12 host required");
+        let heap = HostHeap::new(false, 4).unwrap();
+
+        let first = heap.dynamic(2).unwrap();
+
+        let (buffer, _) =
+            host.shared_buffer(64 << 10).unwrap();
+
+        heap.keep(first, Some(buffer.clone()));
+        heap.keep(first + 1, Some(buffer.clone()));
+
+        {
+            let kept = heap.kept.lock().unwrap();
+
+            assert!(kept[first as usize].is_some());
+            assert!(kept[(first + 1) as usize].is_some());
+        }
+
+        heap.release(first, 1);
+
+        {
+            let kept = heap.kept.lock().unwrap();
+
+            assert!(kept[first as usize].is_none());
+            assert!(kept[(first + 1) as usize].is_some());
+        }
+
+        // Force the allocation search to start at the retired slot.
+        heap.next.lock().unwrap().0 = first - heap.count;
+
+        assert_eq!(heap.dynamic(1), Some(first));
+
+        heap.release(first, 2);
+
+        let kept = heap.kept.lock().unwrap();
+
+        assert!(kept[first as usize].is_none());
+        assert!(kept[(first + 1) as usize].is_none());
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
