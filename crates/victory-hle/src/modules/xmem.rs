@@ -342,7 +342,45 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    reserved: bool,
+}
+
+impl Section {
+    fn new(size: usize, directory: Option<&std::path::Path>) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+
+        // A writable data-file mapping can back the same physical pages at
+        // several addresses without charging their size to system commit.
+        // Create-new and delete-on-close give each section its own lifetime,
+        // even if the process exits while aliases still exist.
+        let file = if let Some(dir) = directory {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("victory-pages-{}-{id}.tmp", std::process::id()));
+            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(path)?;
+            file.set_len(size as u64)?;
+            Some(file)
+        } else {
+            None
+        };
+        let reserved = file.is_none() && !on_wine();
+        let flags = if file.is_some() { 0 } else if reserved { SEC_RESERVE } else { SEC_COMMIT };
+        // SAFETY: the file stays open through section creation. A successful
+        // section holds a reference to the file until its last view is gone.
+        let handle = unsafe {
+            CreateFileMappingW(file.as_ref().map_or(INVALID_HANDLE_VALUE, AsRawHandle::as_raw_handle),
+                std::ptr::null(), PAGE_READWRITE | flags, (size as u64 >> 32) as u32,
+                size as u32, std::ptr::null())
+        };
+        if handle.is_null() { return Err(std::io::Error::last_os_error()); }
+        Ok(Self { handle, reserved })
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -352,7 +390,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -398,37 +436,27 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let directory = if cfg!(feature = "diagnostics") {
+        std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR").filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    } else { None };
+    let section = match Section::new(size, directory.as_deref()) {
+        Ok(section) => Arc::new(section),
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    if cfg!(feature = "diagnostics") && size >= 64 * MIB {
+        tracing::info!(bytes = size, file_backed = directory.is_some(), "guest physical section allocated");
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -478,7 +506,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -489,7 +517,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        (!slice.section.reserved || commit(at.Value as usize, len)).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -701,7 +729,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -721,7 +749,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if slice.section.reserved && !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -734,9 +762,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
-    }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
@@ -919,6 +944,26 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_file_pages_share_writes_and_release_the_file_after_unmapping() {
+        let dir = std::env::temp_dir().join(format!("victory-section-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        {
+            let slice = Slice { section: Arc::new(Section::new(3 * PAGE, Some(&dir)).unwrap()), index: 1 };
+            assert!(!slice.section.reserved);
+            let mut first = View::map(&slice, 1).unwrap();
+            let mut second = View::map(&slice, 1).unwrap();
+            drop(slice);
+            assert!(first.bytes().iter().all(|&value| value == 0));
+            first.bytes()[PAGE - 1] = 81;
+            assert_eq!(second.bytes()[PAGE - 1], 81);
+            drop(first);
+            second.bytes()[0] = 15;
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
