@@ -16,7 +16,7 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,7 @@ pub(crate) struct Pending {
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
-    used: AtomicBool,
+    early_use: AtomicU8,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -55,17 +55,38 @@ impl Pending {
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
-            used: AtomicBool::new(false),
+            early_use: AtomicU8::new(0),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        if self.made
+            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()))
+            .is_some()
+        {
+            self.mark_early_use(COMPILED);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+
+    fn mark_early_use(&self, event: u8) {
+        if first_completed_use(&self.early_use, event) {
+            super::library::note_used(&self.key);
+        }
+    }
+}
+
+const REQUESTED: u8 = 1;
+const COMPILED: u8 = 2;
+
+// A one-shot compute dispatch can exhaust the recording wait budget before
+// its valid PSO finishes. Precompile it on the next run whichever event
+// happened first. A failed PSO never sets COMPILED.
+fn first_completed_use(events: &AtomicU8, event: u8) -> bool {
+    events.load(Ordering::Relaxed) & event == 0
+        && events.fetch_or(event, Ordering::AcqRel) == ((REQUESTED | COMPILED) ^ event)
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -108,15 +129,12 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    p.mark_early_use(REQUESTED);
     if p.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
 /// Queues `p` for the workers, once.
@@ -165,6 +183,10 @@ fn queue(p: Arc<Pending>) {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(feature = "diagnostics")]
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(workers).clamp(1, workers);
+        tracing::info!(workers, "host pipeline compiler workers");
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
@@ -221,6 +243,18 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_single_use_and_early_compilation_both_prime_the_next_run() {
+        for (first, second) in [(REQUESTED, COMPILED), (COMPILED, REQUESTED)] {
+            let events = AtomicU8::new(0);
+            assert!(!first_completed_use(&events, first));
+            assert!(!first_completed_use(&events, first));
+            assert!(first_completed_use(&events, second));
+            assert!(!first_completed_use(&events, second));
+            assert!(!first_completed_use(&events, first));
+        }
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
