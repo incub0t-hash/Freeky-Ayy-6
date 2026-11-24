@@ -2535,7 +2535,8 @@ mod tests {
         let list = host.new_list().expect("direct list");
         let back = host.read_back_buffer(24).expect("readback");
         let draw = |offset| {
-            let gpu = state.bind_image_size(&list, &input).expect("bound size record");
+            let gpu = state.bind_image_size(&list, &input,
+                #[cfg(feature = "diagnostics")] Some(0x1234)).expect("bound size record");
             let (resource, source) = list.scratch_resource(gpu, 8).expect("list-held size record");
             // SAFETY: the list owns the source until completion; the destination has three records.
             unsafe { list.list.CopyBufferRegion(&back, offset, &resource, source, 8) };

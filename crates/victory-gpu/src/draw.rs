@@ -770,7 +770,8 @@ impl State {
 
     /// Capture the shader's proven uniform CBV selector at submission.
     /// Freeze its slot and actual view dimensions until GPU completion.
-    pub(crate) fn bind_image_size(&self, list: &HostList, user: &[victory_shader::emit::UserData]) -> Option<u64> {
+    pub(crate) fn bind_image_size(&self, list: &HostList, user: &[victory_shader::emit::UserData],
+        #[cfg(feature = "diagnostics")] trace: Option<u64>) -> Option<u64> {
         use crate::descriptor::observation;
         let input = user.iter().find(|u| {
             u.root == RootType::Other(victory_shader::emit::USER_IMAGE_SIZE)
@@ -805,6 +806,13 @@ impl State {
             let packed = valid.then(|| heap.image_size(index)).flatten().unwrap_or(0);
             // SAFETY: the second dword of the same upload allocation.
             unsafe { words.add(1).write(packed) };
+            #[cfg(feature = "diagnostics")]
+            if let Some(shader) = trace {
+                let status = if !valid { "material changed or unavailable" }
+                    else if packed == 0 { "view unavailable or unsupported" }
+                    else { "resolved at submission" };
+                puddle::size_outcome(shader, status, Some(index), packed);
+            }
         });
         Some(gpu)
     }
@@ -1033,7 +1041,16 @@ impl State {
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_IMAGE_SIZE {
-                        let Some(gpu) = self.bind_image_size(list, &t.host.user_data) else { return false };
+                        #[cfg(feature = "diagnostics")]
+                        let trace = puddle::size_trace(&stage.shader.hash);
+                        let Some(gpu) = self.bind_image_size(list, &t.host.user_data,
+                            #[cfg(feature = "diagnostics")] trace) else {
+                            #[cfg(feature = "diagnostics")]
+                            if let Some(shader) = trace {
+                                puddle::size_outcome(shader, "binding missing at recording", None, 0);
+                            }
+                            return false;
+                        };
                         // SAFETY: a pixel-only root SRV of two dwords in list-held memory.
                         unsafe { l.SetGraphicsRootShaderResourceView(param, gpu) };
                         continue;
