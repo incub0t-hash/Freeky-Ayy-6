@@ -3201,6 +3201,131 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+
+        // Packed LDS stores must preserve adjacent fields written by
+        // other lanes. Use a single atomic masked update, retrying if
+        // another lane changed the containing word.
+        if matches!(name, "ds_write_b8" | "ds_write_b16") {
+            let half = name == "ds_write_b16";
+
+            let value = self.vgprs(
+                inst,
+                data.first().ok_or("an LDS subword write")?,
+                1,
+            )?[0];
+
+            let c = self.cur;
+            let off = self.s.m.i32(offset);
+            let byte = self.s.m.bin(c, Bin::Add, a, off);
+
+            let two = self.s.m.i32(2);
+            let word = self.s.m.bin(c, Bin::LShr, byte, two);
+
+            // Exclude the private scratch used for Wave64 emulation.
+            let capacity = self.s.m.i32(
+                self.title_lds_dwords as u32
+            );
+
+            let mut valid = self.s.m.cmp(
+                c, pred::IULT, word, capacity
+            );
+
+            // This implementation supports naturally aligned halfwords.
+            if half {
+                let one = self.s.m.i32(1);
+                let zero = self.s.m.i32(0);
+                let low = self.s.m.bin(c, Bin::And, byte, one);
+                let aligned = self.s.m.cmp(
+                    c, pred::EQ, low, zero
+                );
+                valid = self.s.m.bin(
+                    c, Bin::And, valid, aligned
+                );
+            }
+
+            let active = match guard {
+                Some(g) => self.s.m.bin(
+                    c, Bin::And, g, valid
+                ),
+                None => valid,
+            };
+
+            let scope = self.begin_guarded(Some(active));
+
+            let ptr = dword(self, offset);
+            let entry = self.cur;
+
+            let three = self.s.m.i32(3);
+            let lane_byte = self.s.m.bin(
+                entry, Bin::And, byte, three
+            );
+
+            let shift = self.s.m.bin(
+                entry, Bin::Shl, lane_byte, three
+            );
+
+            let field = self.s.m.i32(
+                if half { 0xffff } else { 0xff }
+            );
+
+            let mask = self.s.m.bin(
+                entry, Bin::Shl, field, shift
+            );
+
+            let ones = self.s.m.i32(u32::MAX);
+            let inverse = self.s.m.bin(
+                entry, Bin::Xor, mask, ones
+            );
+
+            let data = self.s.m.bin(
+                entry, Bin::And, value, field
+            );
+
+            let data = self.s.m.bin(
+                entry, Bin::Shl, data, shift
+            );
+
+            let retry = self.s.m.new_block();
+            let done = self.s.m.new_block();
+
+            let zero = self.s.m.i32(0);
+
+            self.s.m.terminate(entry, Term::Br(retry));
+
+            let expected = self.s.m.phi(retry, self.s.t.i32);
+
+            let preserved = self.s.m.bin(
+                retry, Bin::And, expected, inverse
+            );
+
+            let replacement = self.s.m.bin(
+                retry, Bin::Or, preserved, data
+            );
+
+            let observed = self.s.m.cmpxchg(
+                retry, ptr, expected, replacement
+            );
+
+            let success = self.s.m.cmp(
+                retry, pred::EQ, observed, expected
+            );
+
+            self.s.m.set_phi(
+                expected,
+                vec![(zero, entry), (observed, retry)],
+            );
+
+            self.s.m.terminate(
+                retry,
+                Term::CondBr(success, done, retry),
+            );
+
+            self.cur = done;
+            self.end_guarded(scope, &[]);
+
+            return Ok(());
+        }
+
         if let Some(rest) = name.strip_prefix("ds_write") {
             let elements = if rest.starts_with('2') {
                 pair(name)

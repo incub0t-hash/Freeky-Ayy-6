@@ -791,6 +791,83 @@ mod gpu {
         );
     }
 
+
+    #[test]
+    fn gpu_lds_packed_subword_writes() {
+        for half in [false, true] {
+            let mut code = Vec::new();
+
+            // Each lane initializes a separate LDS word.
+            code.push(v_lshlrev_b32(2, inline_u(2), 0));
+            code.push(v_mov_b32(3, LIT));
+            code.push(0xa5a5a5a5);
+
+            code.extend_from_slice(
+                &ds_op(0x0d, 0, 0, 2, 3, 0)
+            );
+
+            code.push(sopp(0x0a, 0));
+
+            // Two lanes update distinct fields of each word.
+            code.push(v_lshlrev_b32(4, inline_u(1), 0));
+
+            if half {
+                code.push(s_mov_b32(12, LIT));
+                code.push(0x1201);
+                code.push(v_add_nc_u32(7, 12, 0));
+            } else {
+                code.push(v_add_nc_u32(7, inline_u(1), 0));
+            }
+
+            code.extend_from_slice(&ds_op(
+                if half { 0x1f } else { 0x1e },
+                0, 0, 4, 7, 0,
+            ));
+
+            code.push(sopp(0x0a, 0));
+
+            // Read the whole containing word.
+            code.push(v_mov_b32(5, LIT));
+            code.push(0xfffffffc);
+            code.push(v_and_b32(6, vgpr(5), 4));
+
+            code.extend_from_slice(
+                &ds_op(0x36, 0, 0, 6, 0, 1)
+            );
+
+            emit_uav_store(&mut code, 1, 0);
+            code.push(S_ENDPGM);
+
+            let prog = make_cs_program(
+                &code, [64, 1, 1], 512, false
+            );
+
+            let expected: Vec<u32> = (0..64u32)
+                .map(|lane| {
+                    let base = lane & !1;
+
+                    if half {
+                        (0x1201 + base)
+                            | ((0x1202 + base) << 16)
+                    } else {
+                        0xa500a500
+                            | (base + 1)
+                            | ((base + 2) << 16)
+                    }
+                })
+                .collect();
+
+            run_on_hosts(
+                if half { "lds_b16" } else { "lds_b8" },
+                &prog,
+                [1, 1, 1],
+                64,
+                &expected,
+                false,
+            );
+        }
+    }
+
     #[test]
     fn gpu_64_threads_lockstep_lds_without_s_barrier() {
         // 64 threads sharing LDS without `s_barrier` (assumes single Wave64 wave on console).
