@@ -423,16 +423,29 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+
+// Conservative upper bound on registered allocation sizes.
+static MAX_REGISTERED_SPAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+
+    let mut map = buffers();
+
+    MAX_REGISTERED_SPAN.fetch_max(len, Ordering::Relaxed);
+
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end,
             shadow: None,
         },
     );
@@ -458,9 +471,15 @@ pub(crate) fn existing_gpu_address(
         let map = buffers();
 
         if let Some((_, entry)) = map
-            .range(..=(address, usize::MAX))
-            .rev()
-            .take(64)
+            .range(
+            (
+                end.saturating_sub(
+                    MAX_REGISTERED_SPAN.load(Ordering::Relaxed)
+                ).min(address),
+                0
+            )..=(address, usize::MAX)
+        )
+        .rev()
             .find(|(_, e)| e.end >= end)
         {
             return entry.shadow.as_ref()
@@ -483,9 +502,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
-        .range(..=(address, usize::MAX))
+        .range(
+            (
+                end.saturating_sub(
+                    MAX_REGISTERED_SPAN.load(Ordering::Relaxed)
+                ).min(address),
+                0
+            )..=(address, usize::MAX)
+        )
         .rev()
-        .take(64)
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
@@ -667,5 +692,57 @@ mod diagnostic_allocation_tests {
         assert!(
             existing_gpu_address(u64::MAX, 256).is_none()
         );
+    }
+}
+
+
+#[cfg(test)]
+mod overlapping_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn registered_buffer_found_beyond_64_smaller_allocations() {
+        let total = 256u64 << 10;
+
+        let mem = crate::resource::Memory::zeroed(
+            total,
+            64 << 10,
+        ).unwrap();
+
+        let base = mem.address();
+
+        register(usize::MAX, base, total);
+
+        for i in 1..=96usize {
+            register(
+                usize::MAX - i,
+                base + i as u64 * 256,
+                256,
+            );
+        }
+
+        let address = base + (128 << 10);
+
+        let shadow = find(address, 256).unwrap();
+
+        let remaining = shadow.left(address);
+        let expected_gpu = shadow.gpu(address);
+
+        #[cfg(feature = "diagnostics")]
+        let diagnostic = existing_gpu_address(address, 256);
+
+        for i in 1..=96usize {
+            unregister(
+                usize::MAX - i,
+                base + i as u64 * 256,
+            );
+        }
+
+        unregister(usize::MAX, base);
+
+        assert_eq!(remaining, total - (128 << 10));
+
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(diagnostic, Some(expected_gpu));
     }
 }
