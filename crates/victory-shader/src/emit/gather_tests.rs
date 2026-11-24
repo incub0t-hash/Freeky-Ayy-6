@@ -66,6 +66,10 @@ const GATHER4_L_O: &[u32] = &[
 /// Lowers a wave32 compute program of 32 threads with `body` between the
 /// prologue and the epilogue.
 fn build(body: &[u32], sampler: Option<[u32; 4]>) -> Result<HostShader, String> {
+    build_for(body, sampler, false)
+}
+
+fn build_for(body: &[u32], sampler: Option<[u32; 4]>, wave64: bool) -> Result<HostShader, String> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -95,7 +99,7 @@ fn build(body: &[u32], sampler: Option<[u32; 4]>) -> Result<HostShader, String> 
     words.extend_from_slice(EPILOGUE);
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![
@@ -105,7 +109,7 @@ fn build(body: &[u32], sampler: Option<[u32; 4]>) -> Result<HostShader, String> 
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -115,7 +119,8 @@ fn build(body: &[u32], sampler: Option<[u32; 4]>) -> Result<HostShader, String> 
     let io = io::raise(&p, &native).expect("io::raise");
     let bytes = crate::dxbc::build(&[]);
     let container = crate::Container::parse(&bytes).unwrap();
-    let mut shader = super::emit(&container, &native, &p, &st, &io, &res, super::Target::ANY)
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    let mut shader = super::emit(&container, &native, &p, &st, &io, &res, target)
         .map_err(|e| e.to_string())?;
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil)
@@ -171,10 +176,14 @@ fn expected(lane: u32, base: u32, max_lod: u32, mode: u32, offset: (i32, i32)) -
 /// hardware GPU and on WARP (each skipped without a device): per one that
 /// ran, each lane's four values.
 fn run(shader: &HostShader, base: u32) -> Vec<(&'static str, Vec<[f32; 4]>)> {
+    run_threads(shader, base, 32)
+}
+
+fn run_threads(shader: &HostShader, base: u32, threads: u32) -> Vec<(&'static str, Vec<[f32; 4]>)> {
     let texels = chain();
     let views = [
         View::Mips { width: SIDE, height: SIDE, levels: LEVELS, base, texels: &texels },
-        View::RawUav(32 * 4),
+        View::RawUav(threads * 4),
     ];
     let mut out = Vec::new();
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -185,6 +194,10 @@ fn run(shader: &HostShader, base: u32) -> Vec<(&'static str, Vec<[f32; 4]>)> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if threads == 64 && !host.target().runs(32) {
+            eprintln!("{label} does not support WaveSize(32); skipped");
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -231,6 +244,24 @@ fn gather_reads_selected_mip_with_sampler_and_view_bounds() {
         for (label, got) in run(&shader, base) {
             assert_eq!(got, want, "{label}, base {base}, max_lod {max_lod}, mode {mode}");
         }
+    }
+}
+
+#[test]
+fn both_halves_gather_when_only_one_half_votes() {
+    let mut body = vec![0x7e18_0280, 0x7e1a_0280, 0x7e1c_0280, 0x7e1e_0280]; // v12..15 = 0
+    body.extend_from_slice(&[
+        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0: only thread zero votes
+        0xbf86_0002, // s_cbranch_vccz skips the two-dword gather
+    ]);
+    body.extend_from_slice(GATHER4_L);
+    let shader = build_for(&body, Some([0x1b6, 12 << 20, 0x1850_0000, 0]), true).unwrap();
+    let c = crate::Container::parse(&shader.dxil).unwrap();
+    let p = c.part(crate::FourCC::PSV0).unwrap().data;
+    assert_eq!(&p[20..28], &[32, 0, 0, 0, 32, 0, 0, 0]);
+    for (device, got) in run_threads(&shader, 0, 64) {
+        let want: Vec<_> = (0..64).map(|lane| expected(lane, 0, 12, 6, (0, 0))).collect();
+        assert_eq!(got, want, "{device}: every lane in both halves follows the single vote");
     }
 }
 
