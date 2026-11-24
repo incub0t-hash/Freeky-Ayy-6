@@ -141,3 +141,24 @@ Actual visual parity remains unverified.
 
 Next: validate GPU-driven geometry, indirect draws,
 depth, materials and final composition.
+
+indirect-readback exit=0; log=D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-readback.log
+
+indirect-gpu-regression exit=0; log=D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-gpu-regression.log
+
+indirect-diagnostic-build exit=0; log=D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-diagnostic-build.log
+
+## Indirect rendering checkpoint
+
+Preserve multidimensional mesh dispatch arguments.
+Prevent indirect-work budget wraparound.
+Retain existing conservative work limits.
+
+GPU readback tests and regression commands passed.
+
+Next:
+- Verify GPU-generated indirect arguments reach rasterization.
+- Exercise buffer-driven geometry and depth.
+- Validate textured geometry and final image composition.
+
+These synthetic tests do not establish game-world parity.

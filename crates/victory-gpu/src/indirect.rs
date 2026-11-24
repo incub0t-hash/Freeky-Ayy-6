@@ -12,7 +12,7 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! groups per dimension and 2^20 per dispatch, bounded multidimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -54,17 +54,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        // Preserve valid three-dimensional mesh dispatches.
+        // Retain the conservative per-dispatch work limit.
+        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
+    // Saturating atomic reservation. Rejected work must not wrap
+    // the counter and accidentally permit more excessive work.
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    budget.InterlockedAdd(0, 0, before);
+
+    [allow_uav_condition]
+    while (true) {
+        if (before >= BUDGET) {
+            args.Store(at, 0);
+            return;
+        }
+
+        uint remaining = BUDGET - before;
+        uint next = before + min(cost, remaining);
+        uint actual;
+
+        budget.InterlockedCompareExchange(
+            0, before, next, actual
+        );
+
+        if (actual == before) {
+            if (cost > remaining) {
+                args.Store(at, 0);
+            }
+            break;
+        }
+
+        before = actual;
     }
 }
 "#;
@@ -213,5 +241,180 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+}
+
+
+#[cfg(test)]
+mod clamp_readback_tests {
+    use super::*;
+
+    // Execute the actual argument-clamping shader on the host GPU.
+    // No game executable, assets or excessive draws are needed.
+    fn run_clamp(
+        kind: u32,
+        input: &[[u32; 4]],
+    ) -> (Vec<[u32; 4]>, u32) {
+        let host = host().expect("Physical GPU required");
+        let clamp = clamp().expect("Argument clamp required");
+
+        let (args, cpu) = host
+            .shared_buffer((input.len() * 16) as u64)
+            .expect("Argument buffer");
+
+        let (budget, budget_cpu) = host
+            .shared_buffer(256)
+            .expect("Budget buffer");
+
+        let list = host.new_list().unwrap();
+
+        let constants = [
+            kind,
+            16,
+            input.len() as u32,
+            0,
+        ];
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                cpu.cast::<[u32; 4]>(),
+                input.len(),
+            );
+
+            budget_cpu.cast::<u32>().write_volatile(0);
+
+            list.list.ResourceBarrier(&[
+                transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+                transition(
+                    &budget,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+
+            list.list.SetComputeRootSignature(&clamp.root);
+            list.list.SetPipelineState(&clamp.pso);
+
+            list.list.SetComputeRoot32BitConstants(
+                0,
+                4,
+                constants.as_ptr().cast(),
+                0,
+            );
+
+            list.list.SetComputeRootUnorderedAccessView(
+                1,
+                args.GetGPUVirtualAddress(),
+            );
+
+            list.list.SetComputeRootUnorderedAccessView(
+                2,
+                budget.GetGPUVirtualAddress(),
+            );
+
+            list.list.Dispatch(
+                (input.len() as u32).div_ceil(64),
+                1,
+                1,
+            );
+
+            list.list.ResourceBarrier(&[
+                uav_barrier(),
+                transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+                transition(
+                    &budget,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+            ]);
+        }
+
+        list.close();
+        host.execute(&[&list]);
+
+        let output = (0..input.len())
+            .map(|i| unsafe {
+                cpu.cast::<[u32; 4]>()
+                    .add(i)
+                    .read_volatile()
+            })
+            .collect();
+
+        let spent = unsafe {
+            budget_cpu.cast::<u32>().read_volatile()
+        };
+
+        list.reset();
+
+        assert!(
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok()
+        );
+
+        (output, spent)
+    }
+
+    #[test]
+    fn preserves_multidimensional_mesh_dispatches() {
+        let input = [
+            [4, 3, 2, 0x12345678],
+            [7, 1, 1, 0x87654321],
+            [0, 8, 9, 0xABCDEF01],
+            [65535, 65535, 2, 0x12344321],
+        ];
+
+        let (output, spent) = run_clamp(3, &input);
+
+        assert_eq!(output[0], input[0]);
+        assert_eq!(output[1], input[1]);
+        assert_eq!(output[2], input[2]);
+
+        assert_eq!(
+            output[3],
+            [0, 0, 0, input[3][3]]
+        );
+
+        assert_eq!(spent, (24 + 7) * 128);
+
+        println!(
+            "VERIFIED: multidimensional mesh arguments preserved"
+        );
+    }
+
+    #[test]
+    fn indirect_work_budget_never_wraps() {
+        // Each record costs 2^26 units. The budget permits two.
+        // There are enough rejected records to overflow the old
+        // 32-bit accumulating counter.
+        let input: Vec<[u32; 4]> = (0..96)
+            .map(|i| [1 << 24, 4, i, 0x12345678])
+            .collect();
+
+        let (output, spent) = run_clamp(0, &input);
+
+        assert_eq!(spent, 1 << 27);
+
+        let accepted = output.iter()
+            .filter(|r| r[0] != 0)
+            .count();
+
+        assert_eq!(accepted, 2);
+
+        for (before, after) in input.iter().zip(&output) {
+            assert_eq!(&before[1..], &after[1..]);
+            assert!(after[0] == 0 || after[0] == before[0]);
+        }
+
+        println!(
+            "VERIFIED: 2 accepted, 94 rejected, budget saturated"
+        );
     }
 }
