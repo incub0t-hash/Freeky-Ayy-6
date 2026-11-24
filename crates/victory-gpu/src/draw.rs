@@ -1461,6 +1461,71 @@ mod exact_table_cache_regression {
         assert_ne!(ka, kc);
     }
 
+
+    #[test]
+    fn deferred_snapshots_reach_gpu_in_order() {
+        let host = crate::host::host().expect("Host device");
+        let list = host.new_list().expect("Command list");
+
+        let mut source = [0x11u8; 16];
+        let replacement = [0x22u8; 16];
+
+        let (first, first_data) = list.upload(host, 256)
+            .expect("First upload");
+
+        let (second, second_data) = list.upload(host, 256)
+            .expect("Second upload");
+
+        let (output, output_data) = host.shared_buffer(256)
+            .expect("Readback allocation");
+
+        assert_eq!(list.title_write_epoch(), 0);
+
+        list.defer_fill(first_data, source.as_ptr(), 16);
+
+        list.defer_copy(
+            source.as_mut_ptr(),
+            replacement.as_ptr(),
+            16,
+        );
+
+        assert_eq!(list.title_write_epoch(), 1);
+
+        list.defer_fill(second_data, source.as_ptr(), 16);
+
+        unsafe {
+            list.list.CopyBufferRegion(
+                &output, 0, &first, 0, 16
+            );
+
+            list.list.CopyBufferRegion(
+                &output, 16, &second, 0, 16
+            );
+
+            list.list.Close().expect("Close command list");
+        }
+
+        host.execute(&[&list]);
+
+        let observed = unsafe {
+            std::slice::from_raw_parts(output_data, 32)
+        };
+
+        assert_eq!(
+            &observed[..16],
+            &[0x11u8; 16],
+            "Original snapshot was overwritten"
+        );
+
+        assert_eq!(
+            &observed[16..32],
+            &[0x22u8; 16],
+            "Updated snapshot did not reach GPU"
+        );
+
+        println!("GPU readback: both snapshots correct");
+    }
+
     #[test]
     fn deferred_writes_change_the_snapshot_epoch() {
         let host = crate::host::host().expect("Host device");
