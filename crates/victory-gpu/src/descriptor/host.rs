@@ -378,11 +378,11 @@ impl HostHeap {
         Some(view)
     }
 
-    /// Whether a mirrored or fresh SRV/UAV has a live D3D12 backing resource.
+    /// The resource already retained by a mirrored or fresh SRV/UAV slot.
     #[cfg(feature = "diagnostics")]
-    pub(crate) fn retains_resource(&self, index: u32) -> Option<bool> {
+    pub(crate) fn retained_resource(&self, index: u32) -> Option<Option<ID3D12Resource>> {
         self.kept.lock().unwrap_or_else(|e| e.into_inner())
-            .get(index as usize).map(Option::is_some)
+            .get(index as usize).cloned()
     }
 
     /// The view host slot `index` was made from, in a few words, with the

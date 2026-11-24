@@ -707,11 +707,15 @@ impl State {
                 .and_then(|base| base.checked_add(u.table_offset_dwords / 8));
             // Fresh constant views use the command list's upload resource; SRV/UAV
             // creation instead retains the actual backing object in the heap slot.
-            let backed = (u.kind != ResourceType::Cbv).then(|| heap.and_then(|h| h.host())
-                .and_then(|host| index.and_then(|i| host.retains_resource(i)))).flatten();
+            let retained = (u.kind != ResourceType::Cbv).then(|| heap.and_then(|h| h.host())
+                .and_then(|host| index.and_then(|i| host.retained_resource(i)))).flatten();
+            let backed = retained.as_ref().map(Option::is_some);
             let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+            let shadow = retained.flatten().and_then(|backing| range.and_then(|(at, n)|
+                crate::shadow::bound_range(&backing, at, n)));
             tracing::info!(hash, recording, slot = u.slot, offset = u.table_offset_dwords,
-                kind = ?u.kind, stride = u.stride, ?index, ?backed, ?range, ?view,
+                kind = ?u.kind, stride = u.stride, ?index, ?backed, ?range,
+                guest_buffer = ?shadow.map(|pair| pair.0), gpu = ?shadow.map(|pair| pair.1), ?view,
                 "sampled compute table descriptor");
         }
     }

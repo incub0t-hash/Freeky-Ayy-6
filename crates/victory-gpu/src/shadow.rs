@@ -445,6 +445,62 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// For a selected binding, look up the already-retained object and byte window.
+/// Returns ((guest buffer base, size), (GPU buffer base, view byte offset)).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bound_range(
+    resource: &ID3D12Resource,
+    address: u64,
+    len: u64,
+) -> Option<((u64, u64), (u64, u64))> {
+    let end = address.checked_add(len.max(1))?;
+    let matching = |s: &Shadow| {
+        (&s.buffer == resource && address >= s.start && end - s.start <= s.len)
+            .then(|| ((s.start, s.len), (s.gpu, address - s.start)))
+    };
+    // Use the same bounded registration search and exact loose-window key as find.
+    // Never call find or loose here: both can allocate a new host backing.
+    let known = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .filter_map(|(_, entry)| entry.shadow.as_deref())
+        .find_map(matching);
+    known.or_else(|| {
+        let start = address & !(WINDOW - 1);
+        let span = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&(start, span))
+            .and_then(|s| matching(s))
+    })
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn bound_range_only_reports_existing_matching_gpu_memory() {
+    let guest = Box::new([0u8; 128]);
+    let address = guest.as_ptr() as u64;
+    let key = (address, address as usize);
+    let (decoy, _) = host().unwrap().shared_buffer(128).unwrap();
+    let offset = 16;
+    let start = (address + offset) & !(WINDOW - 1);
+    let span = (address + offset + 64).next_multiple_of(WINDOW) - start;
+    let loose_present = || LOOSE.lock().unwrap().contains_key(&(start, span));
+    let before = loose_present();
+    register(key.1, key.0, 128);
+    assert_eq!(bound_range(&decoy, address + offset, 64), None);
+    assert!(buffers().get(&key).unwrap().shadow.is_none());
+    assert_eq!(loose_present(), before);
+
+    let shadow = find(address, 128).unwrap();
+    assert_eq!(bound_range(&shadow.buffer, address + offset, 64),
+        Some(((address, 128), (shadow.gpu, offset))));
+    assert_eq!(bound_range(&decoy, address + offset, 64), None);
+    assert_eq!(bound_range(&shadow.buffer, address + offset, 120), None);
+    assert_eq!(bound_range(&shadow.buffer, u64::MAX, 64), None);
+    unregister(key.1, key.0);
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
