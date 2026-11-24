@@ -344,10 +344,17 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = std::collections::HashMap<usize, TextureUse>;
+
+struct TextureUse {
+    first: u32,
+    last: u32,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    /// Advances at every possible write, including repeated UAV uses.
+    writes: u64,
+    /// Writer identity and revision last copied into this texture.
+    packed_from: Option<(usize, u64)>,
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1018,17 +1025,75 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        self.transition_copy(&copy, wanted)
+            .map(|before| (texture, before))
+    }
+
+    fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
-            }
+        let state = states
+            .entry(std::sync::Arc::as_ptr(copy) as usize)
+            .or_insert_with(|| TextureUse {
+                first: wanted,
+                last: wanted,
+                copy: copy.clone(),
+                writes: 0,
+                packed_from: None,
+            });
+        if wanted & (0x4 | 0x8 | 0x10 | 0x400 | 0x1000) != 0 {
+            state.writes += 1;
+            state.packed_from = None;
         }
+        let before = std::mem::replace(&mut state.last, wanted);
+        (before != wanted).then_some(before)
+    }
+
+    /// Copies all mips and slices of a format-compatible packed-light alias.
+    /// Both copies are retained and participate in submission-order barriers.
+    pub(crate) fn copy_packed(
+        &self,
+        dst: &std::sync::Arc<crate::resource::HostTexture>,
+        src: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let src_id = std::sync::Arc::as_ptr(src) as usize;
+        let dst_id = std::sync::Arc::as_ptr(dst) as usize;
+        let version = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            let version = (src_id, states.get(&src_id).map_or(0, |s| s.writes));
+            if states
+                .get(&dst_id)
+                .is_some_and(|s| s.packed_from == Some(version))
+            {
+                return;
+            }
+            version
+        };
+        let move_to = |copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: D3D12_RESOURCE_STATES| {
+            let before = self.transition_copy(copy, wanted.0 as u32)?;
+            let before = D3D12_RESOURCE_STATES(before as i32);
+            let barrier = transition(&copy.texture, before, wanted);
+            // SAFETY: recorded on the open list that holds this host copy.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            Some(before)
+        };
+        let previous = move_to(src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        move_to(dst, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY: the resolver verifies identical shape and compatible formats.
+        unsafe { self.list.CopyResource(&dst.texture, &src.texture) };
+        if let Some(previous) = previous {
+            // The producer may still be bound at another slot of this draw.
+            move_to(src, previous);
+        }
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&dst_id)
+            .unwrap()
+            .packed_from = Some(version);
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -1038,13 +1103,13 @@ impl HostList {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
+            .filter_map(|s| {
+                let real = s.copy.state.swap(s.last, Ordering::Relaxed);
+                (real != s.first).then(|| {
                     transition(
-                        &copy.texture,
+                        &s.copy.texture,
                         D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
+                        D3D12_RESOURCE_STATES(s.first as i32),
                     )
                 })
             })

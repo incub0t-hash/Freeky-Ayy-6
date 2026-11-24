@@ -136,6 +136,10 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+    texture::Texture::new(&texture_description(desc)?).ok()
+}
+
+fn texture_description(desc: &ResourceDesc) -> Option<texture::TextureDesc> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
     const TEXTURE_2D: u32 = 3;
@@ -156,7 +160,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
+    Some(TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -166,7 +170,6 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         samples: desc.sample_count.max(1),
         swizzle,
     })
-    .ok()
 }
 
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
@@ -948,6 +951,20 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if desc.flags & 7 != 0 {
+        let address = resource.data() as usize;
+        let id = std::ptr::from_ref::<Resource>(&resource) as usize;
+        // Validate the complete guest extent once, including the mip tail
+        // and every slice. An unsupported layout cannot establish an alias.
+        let producer = resource.host.as_ref().filter(|_| {
+            desc.format == 42 && desc.flags & 4 != 0
+                && texture_layout(&desc).is_some_and(|t| t.size != 0
+                    && (address as u64).checked_add(t.size).is_some())
+        }).map(std::sync::Arc::downgrade);
+        TEXTURE_WRITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((address, id), (desc, producer));
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -980,6 +997,12 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        } else if self.desc.flags & 7 != 0 {
+            let id = std::ptr::from_ref::<Resource>(self) as usize;
+            TEXTURE_WRITERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(self.data() as usize, id));
         }
     }
 }
@@ -1146,6 +1169,86 @@ pub(crate) extern "system" fn create_at_address(
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// All live writable textures starting at a guest address, including ones the
+/// host could not allocate. Overlapping generations at the same address are
+/// ambiguous until the title releases the old object.
+#[cfg(windows)]
+type TextureWriters = std::collections::BTreeMap<
+    (usize, usize),
+    (ResourceDesc, Option<std::sync::Weak<HostTexture>>),
+>;
+#[cfg(windows)]
+static TEXTURE_WRITERS: std::sync::Mutex<TextureWriters> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A placed RGB9E5 shader view can consume light packed by a UINT UAV into
+/// the same guest storage. D3D12 CopyResource explicitly permits this exact
+/// bit reinterpretation. Compare all subresources and the guest tile mode.
+#[cfg(windows)]
+fn packed_writer(view: This) -> Option<std::sync::Arc<HostTexture>> {
+    let dst = resource(view);
+    if dst.desc.format != 67 || dst.desc.flags & 7 != 0 {
+        return None;
+    }
+    let address = dst.data() as usize;
+    let writers = TEXTURE_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = writers.range((address, 0)..=(address, usize::MAX));
+    let candidate = found.next();
+    let ambiguous = found.next().is_some();
+    #[cfg(feature = "diagnostics")]
+    {
+        static LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(n, address = ?dst.data(), view = ?dst.desc, writer = ?candidate.map(|(_, (d, _))| d),
+                ambiguous, "placed RGB9E5 writer lookup");
+        }
+    }
+    let (_, (src, host)) = candidate?;
+    if ambiguous
+        || src.format != 42
+        || src.flags & 4 == 0
+        || src.dimension != dst.desc.dimension
+        || src.width != dst.desc.width
+        || src.height != dst.desc.height
+        || src.depth_or_array_size != dst.desc.depth_or_array_size
+        || mip_count(src) != mip_count(&dst.desc)
+        || src.sample_count != 1
+        || dst.desc.sample_count != 1
+        || src.sample_quality != 0
+        || dst.desc.sample_quality != 0
+        || texture_description(src)?.swizzle != texture_description(&dst.desc)?.swizzle
+    {
+        return None;
+    }
+    host.as_ref()?.upgrade()
+}
+
+#[cfg(all(windows, test))]
+#[path = "packed_texture_tests.rs"]
+mod packed_texture_tests;
+
+#[cfg(windows)]
+pub(crate) fn copy_packed_view(list: &crate::host::HostList, view: This) -> bool {
+    let Some(src) = packed_writer(view) else {
+        return false;
+    };
+    let Some(dst) = host_copy(view) else {
+        return false;
+    };
+    list.copy_packed(&dst, &src);
+    #[cfg(feature = "diagnostics")]
+    {
+        static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            let r = resource(view);
+            tracing::info!(n, address = ?r.data(), desc = ?r.desc, "placed RGB9E5 view samples its R32_UINT GPU producer");
+        }
+    }
+    true
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
