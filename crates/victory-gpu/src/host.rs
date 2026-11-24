@@ -4802,12 +4802,24 @@ impl HostList {
                 }
             }
         }
-        for (copy, _) in &uploads {
+        let mut before_twin_upload = Vec::new();
+        let mut after_twin_upload = Vec::new();
+        let mut twin_uploads = Vec::new();
+        let mut ordinary_uploads = Vec::new();
+        for (copy, staging) in &uploads {
             let key = std::sync::Arc::as_ptr(copy) as usize;
+            let real = copy.state.load(Ordering::Relaxed);
             if copying.contains_key(&key) {
+                // A twin copy may read this resource. Install the title's
+                // updated texels before that copy transitions its source.
+                if real != COPY_DEST {
+                    before_twin_upload.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                    after_twin_upload.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+                twin_uploads.push((copy, staging));
                 continue;
             }
-            let real = copy.state.load(Ordering::Relaxed);
+            ordinary_uploads.push((copy, staging));
             copying.insert(key, COPY_DEST);
             if real != COPY_DEST {
                 to_copy.push(transition(
@@ -4845,13 +4857,22 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if !before_twin_upload.is_empty() {
+                    list.ResourceBarrier(&before_twin_upload);
+                }
+                for (copy, staging) in &twin_uploads {
+                    staging.record_copy(list, &copy.texture);
+                }
+                if !after_twin_upload.is_empty() {
+                    list.ResourceBarrier(&after_twin_upload);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                for (copy, staging) in &uploads {
+                for (copy, staging) in &ordinary_uploads {
                     staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
