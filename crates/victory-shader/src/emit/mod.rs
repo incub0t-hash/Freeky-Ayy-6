@@ -15,7 +15,19 @@
 //!   heap: the descriptor index times 32 for CBV/SRV/UAV tables, times 16
 //!   for sampler tables (the console's descriptor sizes; the code adds
 //!   offsets in those units). The heap bases of dynamic resources are 0
-//!   and not listed.
+//!   and not listed. Past every other dword the program reads come the
+//!   host's heap bounds, root type `ResourceHeap` (`SamplerHeap`):
+//!   dword 0 is the bound view (sampler) heap's first guard slot, and a
+//!   heap index the code computes at or above it reads a guard slot
+//!   instead (an index past a heap hangs some GPUs): in a view heap the
+//!   one of the read's kind, `guard + heap_guard(kind)` (the host keeps a
+//!   null view of each kind of [`HEAP_GUARDS`] there, as a null view is
+//!   defined only when read as its own kind), in a sampler heap the guard
+//!   itself (any sampler will do). Dword 1 of `ResourceHeap` is the view
+//!   heap's title slots, the bound of a descriptor read straight from the
+//!   heap rather than through a table (past them the host keeps its own
+//!   tables of other draws). The host gives no table a slot at or above
+//!   the guard. The guard scheme is #483's.
 //! * **Descriptors** through SM 6.6 `ResourceDescriptorHeap[]` and
 //!   `SamplerDescriptorHeap[]`, at the index the console address gives, so
 //!   the host heaps keep the title's descriptor order. The root signature
@@ -103,7 +115,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{HEAP_GUARDS, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, heap_guard};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -185,7 +197,8 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
+    /// `Constants` or `Table`, or `ResourceHeap` / `SamplerHeap` for a
+    /// heap bound (see the module notes for the value).
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,

@@ -299,6 +299,24 @@ impl State {
         };
     }
 
+    /// The value of user-data dword `u` of a translated shader: a root
+    /// argument, or a bound heap's bound (`Lower::heap_bound`): its guard
+    /// slot (dword 0), a view heap's title slots (dword 1).
+    fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
+        let heap = |samplers: bool| {
+            let h = self.heaps[usize::from(samplers)];
+            (h != 0)
+                .then(|| crate::descriptor::heap(h as This).host())
+                .flatten()
+        };
+        match (u.root, u.dword) {
+            (RootType::ResourceHeap, 0) => heap(false).map_or(0, |h| h.guard_slot()),
+            (RootType::ResourceHeap, _) => heap(false).map_or(0, |h| h.count()),
+            (RootType::SamplerHeap, _) => heap(true).map_or(0, |h| h.guard_slot()),
+            _ => self.user_value(compute, u.slot, u.root, u.dword),
+        }
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -494,7 +512,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_dword(compute, u),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -582,7 +600,7 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
+                let v = self.user_dword(compute, u);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {

@@ -13,6 +13,29 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// The views a view heap's guard slots hold, from its guard slot on (see
+/// the module notes), as the first word of the DXIL resource properties a
+/// heap read is annotated with: the resource kind, `0x1000` for a UAV. A
+/// null view reads as zero and drops writes only where it is of the kind
+/// the shader reads (D3D12 binding spec, "NULL Descriptors"; GPU-based
+/// validation reports any other), so each kind has its own: SRVs of every
+/// texture kind and of typed, raw and structured buffers, UAVs of the
+/// kinds a UAV can be, and a constant buffer.
+pub const HEAP_GUARDS: [u32; 21] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // SRVs
+    0x1001, 0x1002, 0x1004, 0x1006, 0x1007, 0x100A, 0x100B, 0x100C, // UAVs
+    13,     // constant buffer
+];
+
+/// Which of [`HEAP_GUARDS`] a heap read annotated with `props0` reads in
+/// place of an index out of bounds: its own kind's, else the 2D texture
+/// SRV's.
+pub fn heap_guard(props0: u32) -> u32 {
+    let kind = props0 & 0x10FF;
+    let at = |k| HEAP_GUARDS.iter().position(|&g| g == k);
+    at(kind).or_else(|| at(2)).unwrap_or(0) as u32
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -687,5 +710,30 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEAP_GUARDS, heap_guard};
+
+    /// Every kind of heap read the lowering annotates (resource kinds 1-13,
+    /// `0x1000` for a UAV) has a guard slot of its own kind, so an index out
+    /// of bounds reads a null view of the kind the shader reads.
+    #[test]
+    fn every_heap_read_has_a_guard_of_its_kind() {
+        let srvs = [1, 2, 4, 5, 6, 7, 10, 11, 12];
+        let uavs = [1, 2, 4, 6, 7, 10, 11, 12].map(|k| k | 0x1000);
+        for props in srvs.into_iter().chain(uavs).chain([13]) {
+            assert_eq!(HEAP_GUARDS[heap_guard(props) as usize], props, "{props:#x}");
+        }
+        // Flags beyond the kind and the UAV bit do not change it.
+        assert_eq!(HEAP_GUARDS[heap_guard(0x8000 | 2) as usize], 2);
+        // A kind with no guard of its own reads the 2D texture SRV's.
+        assert_eq!(HEAP_GUARDS[heap_guard(0x1005) as usize], 2);
+        // Each guard once.
+        for (i, g) in HEAP_GUARDS.iter().enumerate() {
+            assert_eq!(heap_guard(*g) as usize, i, "{g:#x}");
+        }
     }
 }

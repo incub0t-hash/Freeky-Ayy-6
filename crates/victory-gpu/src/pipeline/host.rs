@@ -665,3 +665,85 @@ fn root_signature(
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stage's user data as [`HostPipeline::new`] binds it: root
+    /// constants, one dword of the root signature each.
+    fn constants(dwords: u32, visibility: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: visibility,
+        }
+    }
+
+    /// A root CBV as [`HostPipeline::new`] binds one: two dwords.
+    fn root_cbv(visibility: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: visibility,
+        }
+    }
+
+    /// The host takes a root signature of up to 64 dwords and refuses one
+    /// of 65, whatever they are made of (the D3D12 limit); a pipeline whose
+    /// stages' user data and root views pass it is refused (#747: the
+    /// heap bounds' user data must not push one over).
+    #[test]
+    fn root_signatures_hold_64_dwords() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (vs, ps) = (
+            D3D12_SHADER_VISIBILITY_VERTEX,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let cases: [(&str, Vec<D3D12_ROOT_PARAMETER1>, bool); 5] = [
+            (
+                "63: 32 + 31",
+                vec![constants(32, vs), constants(31, ps)],
+                true,
+            ),
+            (
+                "64: 32 + 32",
+                vec![constants(32, vs), constants(32, ps)],
+                true,
+            ),
+            (
+                "64: 30 + 32 + root CBV",
+                vec![constants(30, vs), constants(32, ps), root_cbv(ps)],
+                true,
+            ),
+            (
+                "65: 32 + 31 + root CBV",
+                vec![constants(32, vs), constants(31, ps), root_cbv(ps)],
+                false,
+            ),
+            (
+                "65: 33 + 32",
+                vec![constants(33, vs), constants(32, ps)],
+                false,
+            ),
+        ];
+        for (label, params, takes) in cases {
+            let made = root_signature(&host.device, &params, &[], false).is_ok();
+            assert_eq!(made, takes, "{label}");
+        }
+    }
+}

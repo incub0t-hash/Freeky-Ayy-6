@@ -706,6 +706,8 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
+            // Heap bounds: every view these tests bind is in range.
+            (RootType::ResourceHeap | RootType::SamplerHeap, _) => u32::MAX,
             other => panic!("unexpected user data {other:?}"),
         };
     }
@@ -1031,6 +1033,7 @@ fn float_semantics_are_the_consoles() {
                 views: &views,
                 samplers: &[],
                 groups: [1, 1, 1],
+                placed: None,
             },
         )
         .unwrap();
@@ -1171,6 +1174,7 @@ fn translated_compute_matches_pc() {
         views: &views,
         samplers: &samplers,
         groups: [2, 2, 1],
+        placed: None,
     };
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();

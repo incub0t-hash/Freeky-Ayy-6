@@ -144,12 +144,21 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
                 .compute_pipeline(&cs)
                 .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
             let views = [View::RawUav(wave)];
-            let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            let data = {
+            let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            for u in &cs.user_data {
+                if let Some(bound) = super::host::bound(u, 1, 0) {
+                    data[u.index as usize] = bound;
+                }
+            }
+            data
+        };
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
+                        placed: None,
                         roots: vec![(0, Root::Constants(data))],
                         views: &views,
                         samplers: &[],
@@ -215,9 +224,18 @@ fn lane_read_loop_with_a_joined_exec_back_edge() {
                 &root,
                 &pso,
                 &Dispatch {
+                    placed: None,
                     roots: vec![(
                         0,
-                        Root::Constants(vec![0; (cs.user_data_dwords() as usize).max(1)]),
+                        Root::Constants({
+            let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            for u in &cs.user_data {
+                if let Some(bound) = super::host::bound(u, 1, 0) {
+                    data[u.index as usize] = bound;
+                }
+            }
+            data
+        }),
                     )],
                     views: &[View::RawUav(WAVE)],
                     samplers: &[],

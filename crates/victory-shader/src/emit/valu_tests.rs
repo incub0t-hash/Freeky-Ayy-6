@@ -81,7 +81,15 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words, RootType::Table, 0)
+}
 
+/// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
+/// layout: 4 root constants in `s0..s3`, in `s4` the address of a table
+/// holding a UAV (`heap`: `Table`) or of the view heap itself
+/// (`ResourceHeap`: a descriptor read straight from the heap); then
+/// `unread` more root constants (`s5` on) the program does not read.
+fn lower_cs(words: &[u32], heap: RootType, unread: u8) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -97,17 +105,27 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 slot: 0,
             },
             RootParam {
-                root: RootType::Table,
+                root: heap,
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
                 user_data: 4,
                 slot: 1,
             },
-        ],
+        ]
+        .into_iter()
+        .chain((unread > 0).then_some(RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: u32::from(unread),
+            base_register: 1,
+            user_data: 5,
+            slot: 2,
+        }))
+        .collect(),
         used: vec![UsedResource {
             kind: ResourceType::Uav,
-            root: RootType::Table,
+            root: heap,
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
@@ -116,7 +134,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            rsrc2: u32::from(5 + unread) << 1, // user SGPRs: s0..s4, then the unread ones
             threads: [1, 1, 1],
         }),
         code,
@@ -193,7 +211,8 @@ fn run_cases(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    _ => super::host::bound(u, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {u:?}")),
                 };
             }
             let out = host
@@ -205,6 +224,7 @@ fn run_cases(
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],
+                        placed: None,
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
@@ -939,4 +959,251 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// The view heap of a host capped at 1,000,000 views with the world's heap
+/// (#747): title slots below [`TITLE`], dynamic slots (tables the host
+/// makes per draw) up to the guard slots, the heap's last (one null view
+/// of each kind, see [`super::HEAP_GUARDS`]; [`GUARD`] the first).
+const CAPPED: u32 = 1_000_000;
+const TITLE: u32 = 737_856;
+const GUARD: u32 = CAPPED - super::HEAP_GUARDS.len() as u32;
+/// UAVs at the slots around the bounds: the last title slot, then slots
+/// that hold tables of other draws.
+const PLACED: [u32; 5] = [TITLE - 1, TITLE, 934_463, 934_464, GUARD - 1];
+
+/// A 1-thread program that loads a UAV descriptor at heap address `s4` +
+/// (`s0` << 5), as bindless code adds an index it computes, and stores
+/// `s1` through it.
+fn heap_read_program(heap: RootType) -> HostShader {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, sgpr(1)), // v_mov_b32 v0, s1
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    lower_cs(&words, heap, 0)
+}
+
+/// Runs [`heap_read_program`] on every SM 6.6 device, in the [`CAPPED`]
+/// heap with UAVs at [`PLACED`], for each case (index, table base slot),
+/// with the host's `bounds` (guard slot, title slots) in the user data.
+/// Per device: for each case, which placed UAV got the case's marker
+/// (none: the read went to the null guard slot).
+fn heap_reads(
+    heap: RootType,
+    bounds: (u32, u32),
+    cases: &[(u32, u32)],
+) -> Vec<(&'static str, Vec<Option<usize>>)> {
+    let shader = heap_read_program(heap);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut devices = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut reads = Vec::new();
+        for (i, &(index, base)) in cases.iter().enumerate() {
+            let marker = 0x1000 + i as u32;
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                    (RootType::Constants, 0, 0) => index,
+                    (RootType::Constants, 0, 1) => marker,
+                    (RootType::Constants, 0, _) => 0,
+                    (RootType::Table, 1, _) => base * 32,
+                    (RootType::ResourceHeap, _, 0) => bounds.0,
+                    (RootType::ResourceHeap, _, _) => bounds.1,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let views: Vec<View> = PLACED.iter().map(|_| View::RawUav(1)).collect();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                        placed: Some((CAPPED, &PLACED)),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let hit: Vec<usize> = (0..PLACED.len()).filter(|&j| out[j][0] == marker).collect();
+            assert!(
+                hit.len() <= 1,
+                "{label}: index {index}: written through {hit:?}"
+            );
+            assert!(
+                out.iter().all(|o| o[0] == 0 || o[0] == marker),
+                "{label}: index {index}: a UAV holds another case's value"
+            );
+            reads.push(hit.first().copied());
+        }
+        devices.push((label, reads));
+    }
+    assert!(
+        !devices.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    devices
+}
+
+/// A descriptor read straight from the view heap (bindless) at a title
+/// index the host has a slot for reads the title's descriptor; one at an
+/// index past the title slots (a capped heap leaves those out, and the
+/// host's tables of other draws lie there), the guard slot itself, past
+/// the heap or the last index an address gives reads the null guard: the
+/// store goes nowhere.
+#[test]
+fn direct_heap_reads_past_the_title_slots_read_the_guard() {
+    let cases = [
+        (TITLE - 1, 0),
+        (TITLE, 0),
+        (934_463, 0),
+        (934_464, 0),
+        (GUARD - 1, 0),
+        (GUARD, 0),
+        (999_999, 0),
+        (CAPPED, 0),
+        (1 << 25, 0),
+        (0x07FF_FFFF, 0),
+    ];
+    for (label, reads) in heap_reads(RootType::ResourceHeap, (GUARD, TITLE), &cases) {
+        for (&(index, _), read) in cases.iter().zip(reads) {
+            let want = (index == TITLE - 1).then_some(0);
+            assert_eq!(read, want, "{label}: direct index {index}");
+        }
+    }
+}
+
+/// A table the host made afresh lies in the dynamic slots; reads through
+/// it reach every slot below the guard (its own entries), and stop at the
+/// guard like any other read. A title table reads the title's slots.
+#[test]
+fn table_reads_reach_the_dynamic_slots_up_to_the_guard() {
+    let cases = [
+        (0, TITLE),
+        (196_607, TITLE),
+        (196_608, TITLE),
+        (GUARD - 1 - TITLE, TITLE),
+        (GUARD - TITLE, TITLE),
+        (999_999 - TITLE, TITLE),
+        (CAPPED - TITLE, TITLE),
+        (0, TITLE - 1),
+    ];
+    let want = [
+        Some(1),
+        Some(2),
+        Some(3),
+        Some(4),
+        None,
+        None,
+        None,
+        Some(0),
+    ];
+    for (label, reads) in heap_reads(RootType::Table, (GUARD, TITLE), &cases) {
+        for ((&(k, base), read), want) in cases.iter().zip(reads).zip(want) {
+            assert_eq!(read, want, "{label}: table at {base}, entry {k}");
+        }
+    }
+}
+
+/// The negative control: with one bound for every read (the guard, as
+/// #483 bounds them) or none (as before), a direct read at a title index
+/// past the title slots reaches whatever table another draw has there.
+/// Only indices inside the heap are run unbounded.
+#[test]
+fn without_a_title_bound_direct_reads_reach_other_draws_tables() {
+    let inside = [
+        (TITLE - 1, 0),
+        (TITLE, 0),
+        (934_463, 0),
+        (934_464, 0),
+        (GUARD - 1, 0),
+    ];
+    let want = [Some(0), Some(1), Some(2), Some(3), Some(4)];
+    for bounds in [(GUARD, GUARD), (u32::MAX, u32::MAX)] {
+        for (label, reads) in heap_reads(RootType::ResourceHeap, bounds, &inside) {
+            assert_eq!(reads, want, "{label}: bounds {bounds:?}");
+        }
+    }
+    // One bound still keeps reads off slots past the heap.
+    let past = [(GUARD, 0), (999_999, 0), (CAPPED, 0), (1 << 25, 0)];
+    for (label, reads) in heap_reads(RootType::ResourceHeap, (GUARD, GUARD), &past) {
+        assert_eq!(reads, [None, None, None, None], "{label}");
+    }
+}
+
+/// The heap bounds' user-data entries of `s`: (dword, root type, which).
+fn heap_bound_entries(s: &HostShader) -> Vec<(u32, RootType, u32)> {
+    let mut b: Vec<_> = s
+        .user_data
+        .iter()
+        .filter(|u| matches!(u.root, RootType::ResourceHeap | RootType::SamplerHeap))
+        .map(|u| (u.index, u.root, u.dword))
+        .collect();
+    b.sort_unstable_by_key(|b| b.0);
+    b
+}
+
+/// Where the bounds go: right past every other user-data dword the
+/// program reads, in the order it reads them. Read straight from the
+/// heap it reads s0 and s1 (the heap's base is 0, no dword): the view
+/// guard, then the title slots. Through the table at s4: the guard only.
+#[test]
+fn heap_bounds_are_user_data_past_the_reads() {
+    assert_eq!(
+        heap_bound_entries(&heap_read_program(RootType::ResourceHeap)),
+        [
+            (2, RootType::ResourceHeap, 0),
+            (3, RootType::ResourceHeap, 1)
+        ]
+    );
+    assert_eq!(
+        heap_bound_entries(&heap_read_program(RootType::Table)),
+        [(5, RootType::ResourceHeap, 0)]
+    );
+}
+
+/// The host root signature holds 64 dwords for all of a pipeline's
+/// stages, each stage's user data rounded up to a row of 4. Past a
+/// layout of 31 user SGPRs (the most a console stage has) of which the
+/// program reads a few, the bounds would take 32 dwords more; right past
+/// the reads they fit in the row the reads already take.
+#[test]
+fn heap_bounds_cost_no_more_than_the_reads_need() {
+    let words = [
+        s_mov_b32(5, 0x80),
+        sop2(0x1E, 6, 0, 0x85),
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, sgpr(1)),
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    // (heap, user-data dwords the reads take without bounds, with them)
+    for (heap, reads, dwords) in [(RootType::ResourceHeap, 2, 4), (RootType::Table, 5, 8)] {
+        let narrow = lower_cs(&words, heap, 0);
+        let wide = lower_cs(&words, heap, 26);
+        assert_eq!(wide.user_data, narrow.user_data, "{heap:?}");
+        assert_eq!(wide.user_data_dwords(), dwords, "{heap:?}");
+        assert_eq!(
+            u32::next_multiple_of(reads, 4),
+            dwords,
+            "{heap:?}: no row more"
+        );
+    }
 }

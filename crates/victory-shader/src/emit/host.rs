@@ -1036,6 +1036,191 @@ pub struct Dispatch<'a> {
     pub views: &'a [View<'a>],
     pub samplers: &'a [D3D12_SAMPLER_DESC],
     pub groups: [u32; 3],
+    /// Where the views go: `None` in order from slot 0, with the guard
+    /// slots after them ([`bound`]); else the view heap's size and each
+    /// view's slot, the guard slots last, every other slot null.
+    pub placed: Option<(u32, &'a [u32])>,
+}
+
+/// The user-data value of a translated shader's heap bound entry (root
+/// type `ResourceHeap` or `SamplerHeap`, see `Lower::heap_bound`) for a
+/// [`Host::dispatch`] with `views` views in order and `samplers` samplers:
+/// the first guard slot after the views, as many title slots as views,
+/// the last sampler. `None` for other entries.
+#[cfg(test)]
+pub fn bound(u: &super::UserData, views: usize, samplers: usize) -> Option<u32> {
+    use crate::native::RootType;
+    match u.root {
+        RootType::ResourceHeap => Some(views as u32),
+        RootType::SamplerHeap => Some(samplers.saturating_sub(1) as u32),
+        _ => None,
+    }
+}
+
+/// Makes the slots of view heap `heap` from `first` on the host's guard
+/// slots: one null view of each kind of [`super::HEAP_GUARDS`], as
+/// `victory-gpu` makes them (`descriptor::host::null_guard`).
+#[cfg(test)]
+fn null_guards(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, first: u32) {
+    let heap_kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: slots inside a live heap; null resources with descriptions,
+    // a null constant buffer view with none.
+    unsafe {
+        let step = dev.GetDescriptorHandleIncrementSize(heap_kind) as usize;
+        let start = heap.GetCPUDescriptorHandleForHeapStart();
+        for (i, &guard) in super::HEAP_GUARDS.iter().enumerate() {
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + (first as usize + i) * step,
+            };
+            let (uav, kind) = (guard & 0x1000 != 0, guard & 0xFF);
+            if kind == 13 {
+                dev.CreateConstantBufferView(None, at);
+            } else if uav {
+                let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ..Default::default()
+                };
+                desc.ViewDimension = match kind {
+                    1 => D3D12_UAV_DIMENSION_TEXTURE1D,
+                    4 => {
+                        desc.Anonymous.Texture3D.WSize = u32::MAX;
+                        D3D12_UAV_DIMENSION_TEXTURE3D
+                    }
+                    6 => {
+                        desc.Anonymous.Texture1DArray.ArraySize = 1;
+                        D3D12_UAV_DIMENSION_TEXTURE1DARRAY
+                    }
+                    7 => {
+                        desc.Anonymous.Texture2DArray.ArraySize = 1;
+                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                    }
+                    10..=12 => {
+                        desc.Anonymous.Buffer.NumElements = 1;
+                        if kind == 11 {
+                            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                            desc.Anonymous.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                        } else if kind == 12 {
+                            desc.Format = DXGI_FORMAT_UNKNOWN;
+                            desc.Anonymous.Buffer.StructureByteStride = 4;
+                        }
+                        D3D12_UAV_DIMENSION_BUFFER
+                    }
+                    _ => D3D12_UAV_DIMENSION_TEXTURE2D,
+                };
+                dev.CreateUnorderedAccessView(None, None, Some(&desc), at);
+            } else {
+                let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    ..Default::default()
+                };
+                let a = &mut desc.Anonymous;
+                desc.ViewDimension = match kind {
+                    1 => {
+                        a.Texture1D.MipLevels = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE1D
+                    }
+                    3 => D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                    4 => {
+                        a.Texture3D.MipLevels = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE3D
+                    }
+                    5 => {
+                        a.TextureCube.MipLevels = 1;
+                        D3D12_SRV_DIMENSION_TEXTURECUBE
+                    }
+                    6 => {
+                        a.Texture1DArray.MipLevels = 1;
+                        a.Texture1DArray.ArraySize = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE1DARRAY
+                    }
+                    7 => {
+                        a.Texture2DArray.MipLevels = 1;
+                        a.Texture2DArray.ArraySize = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+                    }
+                    8 => {
+                        a.Texture2DMSArray.ArraySize = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+                    }
+                    9 => {
+                        a.TextureCubeArray.MipLevels = 1;
+                        a.TextureCubeArray.NumCubes = 1;
+                        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY
+                    }
+                    10..=12 => {
+                        a.Buffer.NumElements = 1;
+                        desc.Format = DXGI_FORMAT_R32_UINT;
+                        if kind == 11 {
+                            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                            a.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                        } else if kind == 12 {
+                            desc.Format = DXGI_FORMAT_UNKNOWN;
+                            a.Buffer.StructureByteStride = 4;
+                        }
+                        D3D12_SRV_DIMENSION_BUFFER
+                    }
+                    _ => {
+                        a.Texture2D.MipLevels = 1;
+                        D3D12_SRV_DIMENSION_TEXTURE2D
+                    }
+                };
+                dev.CreateShaderResourceView(None, Some(&desc), at);
+            }
+        }
+    }
+}
+
+/// Makes `n` slots of view heap `heap` from `first` on null, as the host
+/// makes its empty slots (a null 2D texture view): one block made, then
+/// copied.
+#[cfg(test)]
+fn null_views(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, first: u32, n: u32) {
+    const BLOCK: u32 = 1 << 16;
+    if n == 0 {
+        return;
+    }
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: slots inside live heaps; the CPU-side block outlives the
+    // copies.
+    unsafe {
+        let step = dev.GetDescriptorHandleIncrementSize(kind) as usize;
+        let block: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: BLOCK.min(n),
+                ..Default::default()
+            })
+            .expect("a CPU descriptor heap");
+        let start = block.GetCPUDescriptorHandleForHeapStart();
+        for i in 0..BLOCK.min(n) as usize {
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + i * step,
+            };
+            dev.CreateShaderResourceView(None, Some(&desc), at);
+        }
+        let to = heap.GetCPUDescriptorHandleForHeapStart();
+        let mut done = 0;
+        while done < n {
+            let k = BLOCK.min(n - done);
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: to.ptr + (first + done) as usize * step,
+            };
+            dev.CopyDescriptorsSimple(k, at, start, kind);
+            done += k;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1160,7 +1345,27 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            // In order with a null guard slot after the views (see
+            // [`bound`]), or placed in a heap whose other slots are null.
+            let (view_slots, slot_of): (u32, Box<dyn Fn(usize) -> usize>) = match d.placed {
+                None => (
+                    (d.views.len() + super::HEAP_GUARDS.len()) as u32,
+                    Box::new(|i| i),
+                ),
+                Some((size, at)) => {
+                    assert_eq!(at.len(), d.views.len(), "a slot for every view");
+                    let guards = super::HEAP_GUARDS.len() as u32;
+                    assert!(
+                        at.iter().all(|&s| s < size - guards),
+                        "slots inside the heap, below its guard slots"
+                    );
+                    (size, Box::new(move |i| at[i] as usize))
+                }
+            };
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slots as usize)?;
+            null_views(dev, &views, 0, view_slots);
+            // The guard slots, one null view of each kind, end the heap.
+            null_guards(dev, &views, view_slots - super::HEAP_GUARDS.len() as u32);
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -1172,7 +1377,7 @@ impl Host {
             let mut uavs = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
-                at.ptr += i * view_size;
+                at.ptr += slot_of(i) * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {

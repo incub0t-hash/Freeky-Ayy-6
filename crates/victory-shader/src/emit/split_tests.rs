@@ -78,7 +78,15 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
             .map_err(|e| format!("validation: {e}"))?;
     }
     let (root, pso) = host.compute_pipeline(&cs)?;
-    let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+    let data = {
+            let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            for u in &cs.user_data {
+                if let Some(bound) = super::host::bound(u, 1, 0) {
+                    data[u.index as usize] = bound;
+                }
+            }
+            data
+        };
     let StageIo::Cs(io) = &native.io else {
         unreachable!()
     };
@@ -88,6 +96,7 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
         &root,
         &pso,
         &Dispatch {
+            placed: None,
             roots: vec![(0, Root::Constants(data))],
             views: &views,
             samplers: &[],
