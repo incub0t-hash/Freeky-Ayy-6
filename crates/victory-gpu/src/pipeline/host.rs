@@ -324,7 +324,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>,
+        #[cfg(feature = "diagnostics")] mut audit: Option<&mut String>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -360,9 +361,20 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            if s.translated().is_none() {
+                #[cfg(feature = "diagnostics")]
+                if let Some(reason) = audit.as_deref_mut()
+                    && let Some(Err(error)) = s.translated.get() {
+                    *reason = format!("shader translation: {error}");
+                }
+                return None;
+            }
         }
-        let host = host()?;
+        let Some(host) = host() else {
+            #[cfg(feature = "diagnostics")]
+            if let Some(reason) = audit.as_deref_mut() { *reason = "D3D12 device unavailable".into(); }
+            return None;
+        };
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -491,6 +503,8 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                #[cfg(feature = "diagnostics")]
+                if let Some(reason) = audit.as_deref_mut() { *reason = format!("root signature: {e}"); }
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
@@ -522,6 +536,8 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(reason) = audit.as_deref_mut() { *reason = format!("compute PSO: {e}"); }
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;

@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    audit_builder: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +58,31 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            audit_builder: false,
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn audit_builder(mut self) -> Self {
+        super::builder_readiness::created(&self.shaders[0].hash);
+        self.audit_builder = true;
+        self
+    }
+
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let mut reason = String::new();
+            let host = HostPipeline::new(&self.shaders, self.graphics.as_deref(),
+                #[cfg(feature = "diagnostics")]
+                self.audit_builder.then_some(&mut reason));
+            #[cfg(feature = "diagnostics")]
+            if self.audit_builder {
+                super::builder_readiness::checked(&self.shaders[0].hash, host.is_some(), &reason);
+            }
+            host
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -79,7 +100,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| matches!(s.translated.get(), Some(Err(_))))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
@@ -140,6 +161,13 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    #[cfg(feature = "diagnostics")]
+    if p.audit_builder {
+        // Use the ordinary low-priority worker queue. No command list or
+        // dispatch is needed to find out whether the actual pipeline builds.
+        start(p, EARLY);
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);

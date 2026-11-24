@@ -62,7 +62,7 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: OnceLock<Result<Translated, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -166,9 +166,10 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
-                done.ok()
+                done
             })
             .as_ref()
+            .ok()
     }
 }
 
@@ -283,6 +284,10 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if builder_readiness::enabled() {
+        return false;
+    }
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
@@ -500,13 +505,28 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // A capability query or an unsupported interface creates no pipeline.
+    // In particular it cannot become an all-stages dependency of the builder.
+    if !object::is(iid, &PIPELINE_IIDS) {
+        return object::answer(PIPELINE, iid, None, out);
+    }
+    if out.is_null() {
+        return object::S_FALSE;
+    }
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let builder = of_builder(&shaders);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let audit = builder && builder_readiness::enabled();
+    #[cfg(windows)]
+    let host = Arc::new({
+        let pending = make::Pending::new(shaders.clone(), graphics);
+        #[cfg(feature = "diagnostics")]
+        let pending = if audit { pending.audit_builder() } else { pending };
+        pending
+    });
     #[cfg(windows)]
     make::early(&host);
-    #[cfg(windows)]
-    let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -694,6 +714,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod builder_readiness;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
