@@ -651,6 +651,126 @@ const MS_CASES: &[(&str, u32, &str)] = &[
     ),
 ];
 
+/// Hand-encoded console mesh program from the local mesh raster oracle. Only
+/// lanes `first_vertex % 64 .. +2` make a nondegenerate triangle. Connectivity
+/// uses the full vertex indices, including when vertices 96–98 provide it.
+fn lane_triangle(threads: u32, first_vertex: u32) -> crate::NativeProgram {
+    use crate::native::{HwStage, MeshIo, NativeProgram, StageIo};
+
+    fn vop3(op: u32, dst: u32, a: u32, b: u32, c: u32) -> [u32; 2] {
+        [0xd400_0000 | (op << 16) | dst, a | (b << 9) | (c << 18)]
+    }
+    fn literal(words: &mut Vec<u32>, dst: u32, bits: u32) {
+        words.extend([0x7e00_02ff | (dst << 17), bits]);
+    }
+    fn select_lane(words: &mut Vec<u32>, dst: u32, lane: u32, src: u32) {
+        // v_cmp_eq_u32 s[10:11], lane, v0; v_cndmask_b32 vdst, vdst, vsrc, s[10:11]
+        words.extend(vop3(0x0c2, 10, 128 + lane, 256, 0));
+        words.extend(vop3(0x101, dst, 256 + dst, 256 + src, 10));
+    }
+    let lane = first_vertex % 64;
+    let mut words = Vec::new();
+    // v_mbcnt_lo/hi_u32_b32 with all 64 mask bits set.
+    words.extend(vop3(0x365, 0, 193, 128, 0));
+    words.extend(vop3(0x366, 0, 193, 256, 0));
+    literal(&mut words, 1, (-1.0f32).to_bits());
+    literal(&mut words, 2, (-1.0f32).to_bits());
+    literal(&mut words, 3, 0.5f32.to_bits());
+    literal(&mut words, 4, 1.0f32.to_bits());
+    literal(&mut words, 5, 3.0f32.to_bits());
+    if threads == 128 && first_vertex == 64 {
+        // Only lane 40 in the second console wave has the positive coordinate.
+        // The vertices in lanes 0–2 of that same wave must retrieve it across
+        // a hardware wave boundary. Reading lane 8 or wave zero collapses it.
+        words.extend([0x7e0c_0203, 0x360c_0cff, 0x0f00_0000]); // v6 = s3 & wave-index mask
+        words.extend(vop3(0x0c2, 10, 262, 128, 0));
+        words.extend(vop3(0x101, 5, 261, 257, 10)); // first wave gets -1
+        literal(&mut words, 6, (-1.0f32).to_bits());
+        select_lane(&mut words, 6, 40, 5);
+        words.extend(vop3(0x360, 9, 262, 128 + 40, 0)); // s9 = v6[lane 40]
+        words.push(0x7e0a_0209); // v_mov_b32 v5, s9
+    }
+    select_lane(&mut words, 1, lane + 1, 5);
+    select_lane(&mut words, 2, lane + 2, 5);
+    words.extend([0xf800_00cf, 0x0403_0201]); // exp pos0, v[1:4]
+    literal(&mut words, 6, 0); // all other triangles have zero area
+    let indices = first_vertex | ((first_vertex + 1) << 10) | ((first_vertex + 2) << 20);
+    literal(&mut words, 7, indices);
+    select_lane(&mut words, 6, lane, 7);
+    words.extend([0xf800_0941, 6, 0xbf81_0000]); // exp prim, v6; s_endpgm
+    NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads,
+            max_vertices: threads,
+            max_primitives: threads,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+    }
+}
+
+#[test]
+#[ignore = "needs a mesh-capable fixed-wave32 GPU and the PC DXC and DXIL validator"]
+fn wave64_mesh_halves_rasterize_reference_triangle() {
+    use super::container::SigElement;
+    let host = Host::new(false).unwrap();
+    let target = host.target();
+    assert_eq!((target.lanes_min, target.lanes_max), (32, 32));
+    let path = super::validator::Validator::default_path();
+    let mut validator = super::validator::Validator::load(path.as_deref()).unwrap();
+    let pc = std::env::var_os("VICTORY_PC_DXC").map(PathBuf::from)
+        .or_else(|| path.map(|p| p.with_file_name("dxc.exe"))).unwrap();
+    let dir = std::env::temp_dir().join(format!("victory-mesh-halves-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let reference = MS_CASES.iter().find(|c| c.0 == "one triangle").unwrap();
+    let pc_mesh = compile(&pc, &dir, reference.2, "ms", "ms_6_5");
+    let ps = compile(&pc, &dir, r#"[RootSignature(RS)]
+        float4 mflat() : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }"#, "mflat", "ps_6_5");
+    // SAFETY: PC DXC embeds the root signature in the compiled reference shader.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &pc_mesh) }.unwrap();
+    let draw = |mesh: &[u8]| {
+        let pso = host.mesh_pipeline_with(&root, mesh, &ps).unwrap();
+        host.draw(&root, &pso, &Draw {
+            roots: vec![(0, Root::Constants(vec![0; 4]))],
+            textures: &[], samplers: &[], vertices: &[], stride: 0,
+            size: (32, 32), mesh_groups: 1,
+        }).unwrap()
+    };
+    let expected = draw(&pc_mesh);
+    assert_eq!(expected.len(), 32 * 32);
+    assert!(expected.iter().all(|p| *p == [0.25, 0.5, 0.75, 1.0]));
+
+    let pos = super::container::signature(&[SigElement {
+        name: "SV_Position".into(), index: 0, kind: 3, comp: 9, interp: 0,
+        row: Some(0), col: 0, cols: 4, usage: 15, half: false,
+    }], false);
+    let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &pos)]);
+    let container = super::Container::parse(&bytes).unwrap();
+    for (threads, first_vertex) in [(64, 0), (64, 32), (128, 96), (128, 64)] {
+        let native = lane_triangle(threads, first_vertex);
+        let ir = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let blocks = crate::structure::structure(&ir).unwrap();
+        let resources = crate::resource::track(&ir, &native.layout, native.stage, Some(&blocks)).unwrap();
+        let io = crate::io::raise(&ir, &native).unwrap();
+        let mut ms = super::emit(&container, &native, &ir, &blocks, &io, &resources, target).unwrap();
+        assert!(ms.mesh_wave32_compatible);
+        validator.validate(&mut ms.dxil).unwrap();
+        let pixels = draw(&ms.dxil);
+        assert_eq!(pixels.len(), expected.len());
+        assert_eq!(pixels.iter().position(|p| *p != expected[0]), None,
+            "threads={threads}, first_vertex={first_vertex}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn tools() -> Option<(PathBuf, PathBuf)> {
     let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
     let pc = match std::env::var_os("VICTORY_PC_DXC") {

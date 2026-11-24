@@ -338,7 +338,17 @@ fn wave_lanes_refusal(
     console_wave64: bool,
     emitted_wave: Option<(u32, u32)>,
     host_lanes: (u32, u32),
+    mesh_wave32_compatible: bool,
 ) -> Option<std::borrow::Cow<'static, str>> {
+    // Mesh DXIL cannot request WaveSize. Only the translator can certify its
+    // handling of dependencies between the halves of a console wave.
+    if stage == "mesh"
+        && mesh_wave32_compatible
+        && host_lanes == (32, 32)
+        && emitted_wave.is_none()
+    {
+        return None;
+    }
     if !wave_lanes_unsupported(stage, console_wave64, emitted_wave, host_lanes) {
         return None;
     }
@@ -413,15 +423,16 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
-        if let Some(ms) = mesh
-            && let Some(reason) = wave_lanes_refusal(ms.stage, ms.wave64(), None, host_lanes)
-        {
-            return refuse(&reason, shaders);
-        }
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if let Some(reason) = wave_lanes_refusal(s.stage, s.wave64(), emitted, host_lanes) {
+            if let Some(reason) = wave_lanes_refusal(
+                s.stage,
+                s.wave64(),
+                emitted,
+                host_lanes,
+                t.host.mesh_wave32_compatible,
+            ) {
                 return refuse(&reason, shaders);
             }
         }
@@ -865,20 +876,29 @@ mod tests {
     }
 
     #[test]
+    fn mesh_certificate_only_admits_unsized_mesh_on_fixed_wave32() {
+        assert!(wave_lanes_refusal("mesh", true, None, (32, 32), true).is_none());
+        assert!(wave_lanes_refusal("mesh", true, None, (32, 32), false).is_some());
+        assert!(wave_lanes_refusal("mesh", true, None, (4, 4), true).is_some());
+        assert!(wave_lanes_refusal("compute", true, None, (32, 32), true).is_some());
+        assert!(wave_lanes_refusal("mesh", true, Some((64, 64)), (32, 32), true).is_some());
+    }
+
+    #[test]
     fn wave_lanes_refusal_reports_emitted_and_host_ranges() {
         let wave32_on_64 =
-            wave_lanes_refusal("compute", true, Some((32, 32)), (64, 64)).expect("refused");
+            wave_lanes_refusal("compute", true, Some((32, 32)), (64, 64), false).expect("refused");
         assert!(wave32_on_64.contains("[32, 32]"));
         assert!(wave32_on_64.contains("[64, 64]"));
         assert!(!wave32_on_64.contains("64-lane waves"));
 
         let wave64_on_32 =
-            wave_lanes_refusal("compute", true, Some((64, 64)), (32, 32)).expect("refused");
+            wave_lanes_refusal("compute", true, Some((64, 64)), (32, 32), false).expect("refused");
         assert!(wave64_on_32.contains("[64, 64]"));
         assert!(wave64_on_32.contains("[32, 32]"));
         assert!(!wave64_on_32.contains("64-lane waves"));
 
-        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32)).expect("refused");
+        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32), false).expect("refused");
         assert_eq!(
             unsized_on_32,
             "a shader requiring 64-lane waves, on a host without them"
