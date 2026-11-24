@@ -794,7 +794,14 @@ mod gpu {
 
     #[test]
     fn gpu_lds_packed_subword_writes() {
-        for half in [false, true] {
+        for (half, high, byte_offset) in [
+            (false, false, 0),
+            (false, false, 1),
+            (false, true, 0),
+            (false, true, 1),
+            (true, false, 0),
+            (true, true, 0),
+        ] {
             let mut code = Vec::new();
 
             // Each lane initializes a separate LDS word.
@@ -819,9 +826,26 @@ mod gpu {
                 code.push(v_add_nc_u32(7, inline_u(1), 0));
             }
 
+            if high {
+                code.push(v_lshlrev_b32(
+                    7, inline_u(16), 7
+                ));
+
+                // The low half deliberately differs.
+                code.push(v_add_nc_u32(
+                    7, inline_u(1), 7
+                ));
+            }
+
+            let opcode = match (half, high) {
+                (false, false) => 0x1e,
+                (true, false) => 0x1f,
+                (false, true) => 0xa0,
+                (true, true) => 0xa1,
+            };
+
             code.extend_from_slice(&ds_op(
-                if half { 0x1f } else { 0x1e },
-                0, 0, 4, 7, 0,
+                opcode, byte_offset, 0, 4, 7, 0,
             ));
 
             code.push(sopp(0x0a, 0));
@@ -849,10 +873,14 @@ mod gpu {
                     if half {
                         (0x1201 + base)
                             | ((0x1202 + base) << 16)
-                    } else {
+                    } else if byte_offset == 0 {
                         0xa500a500
                             | (base + 1)
                             | ((base + 2) << 16)
+                    } else {
+                        0x00a500a5
+                            | ((base + 1) << 8)
+                            | ((base + 2) << 24)
                     }
                 })
                 .collect();

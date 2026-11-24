@@ -3205,8 +3205,14 @@ impl<'a> Lower<'a> {
         // Packed LDS stores must preserve adjacent fields written by
         // other lanes. Use a single atomic masked update, retrying if
         // another lane changed the containing word.
-        if matches!(name, "ds_write_b8" | "ds_write_b16") {
-            let half = name == "ds_write_b16";
+        if matches!(
+            name,
+            "ds_write_b8" | "ds_write_b16"
+                | "ds_write_b8_d16_hi"
+                | "ds_write_b16_d16_hi"
+        ) {
+            let half = name.starts_with("ds_write_b16");
+            let high = name.ends_with("_d16_hi");
 
             let value = self.vgprs(
                 inst,
@@ -3276,6 +3282,15 @@ impl<'a> Lower<'a> {
             let inverse = self.s.m.bin(
                 entry, Bin::Xor, mask, ones
             );
+
+            let value = if high {
+                let sixteen = self.s.m.i32(16);
+                self.s.m.bin(
+                    entry, Bin::LShr, value, sixteen
+                )
+            } else {
+                value
+            };
 
             let data = self.s.m.bin(
                 entry, Bin::And, value, field
