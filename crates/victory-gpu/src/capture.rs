@@ -391,7 +391,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     // Channel values as floats, then scaled.
-    type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
+    type Decode = Box<dyn Fn(&[u8]) -> [f64; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
             if !rows_fit(w, h, 4, pitch, rows.len()) { return None; }
@@ -418,28 +418,44 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+            [v & 0x3ff, v >> 10 & 0x3ff, v >> 20 & 0x3ff].map(f64::from)
         })),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
+            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)].map(f64::from)
         })),
-        9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
-        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
+        67 => (4, Box::new(move |b| {
+            let v = u32_at(b, 0);
+            let scale = 2f64.powi((v >> 27) as i32 - 24);
+            [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|m| f64::from(m) * scale)
+        })),
+        9..=10 => (8, Box::new(move |b| [0, 1, 2].map(|i| f64::from(half(u16_at(b, i)))))),
+        11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f64::from(u16_at(b, i))))),
+        13..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f64::from(u16_at(b, i) as i16)))),
+        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0].map(f64::from))),
         1..=2 => (16, Box::new(move |b| {
-            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
+            [0, 1, 2].map(|i| f64::from(f32::from_bits(u32_at(b, i))))
         })),
-        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0].map(f64::from))),
+        17 => (8, Box::new(move |b| [u32_at(b, 0), u32_at(b, 1), 0].map(f64::from))),
+        18 => (8, Box::new(move |b| [u32_at(b, 0) as i32, u32_at(b, 1) as i32, 0].map(f64::from))),
+        35..=36 => (4, Box::new(move |b| [u16_at(b, 0), u16_at(b, 1), 0].map(f64::from))),
+        37..=38 => (4, Box::new(move |b| [u16_at(b, 0) as i16, u16_at(b, 1) as i16, 0].map(f64::from))),
+        48..=50 => (2, Box::new(move |b| [b[0], b[1], 0].map(f64::from))),
+        51..=52 => (2, Box::new(move |b| [b[0] as i8, b[1] as i8, 0].map(f64::from))),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
-        53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        39..=41 => (4, Box::new(move |b| [f64::from(f32::from_bits(u32_at(b, 0))); 3])),
+        42 => (4, Box::new(move |b| [f64::from(u32_at(b, 0)); 3])),
+        43 => (4, Box::new(move |b| [f64::from(u32_at(b, 0) as i32); 3])),
+        19..=21 => (8, Box::new(move |b| [f64::from(f32::from_bits(u32_at(b, 0))); 3])),
+        22 => (8, Box::new(move |b| [f64::from(b[4]); 3])),
+        44..=46 => (4, Box::new(move |b| [f64::from(u32_at(b, 0) & 0xff_ffff); 3])),
+        47 => (4, Box::new(move |b| [f64::from(b[3]); 3])),
+        53..=54 => (2, Box::new(move |b| [f64::from(half(u16_at(b, 0))); 3])),
+        55..=57 => (2, Box::new(move |b| [f64::from(u16_at(b, 0)); 3])),
+        58..=59 => (2, Box::new(move |b| [f64::from(u16_at(b, 0) as i16); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f64::from(b[0]); 3])),
+        63..=64 => (1, Box::new(move |b| [f64::from(b[0] as i8); 3])),
         _ => return None,
     };
     if !rows_fit(w, h, n, pitch, rows.len()) { return None; }
@@ -451,9 +467,9 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
     let finite = values().flatten().filter(|v| v.is_finite());
     let (low, high) = if grey {
-        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
+        finite.fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(v), h.max(v)))
     } else {
-        (0.0, finite.fold(0.0f32, f32::max))
+        (0.0, finite.fold(0.0f64, f64::max))
     };
     let range = (high - low).max(1e-20);
     tracing::info!(format, low, high, "target values");
@@ -593,6 +609,17 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integer_and_shared_exponent_targets_preserve_channel_values() {
+        let words: Vec<_> = [0xffff_fffeu32, 0xffff_ffff].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &words).unwrap(), [0, 0, 0, 255, 255, 255, 255, 255]);
+        let signed: Vec<_> = [i32::MIN, 0, i32::MAX].into_iter().flat_map(i32::to_le_bytes).collect();
+        assert_eq!(super::to_rgba(43, 3, 1, 12, &signed).unwrap()[4], 127);
+        let rg: Vec<_> = [4u32, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(super::to_rgba(17, 1, 1, 8, &rg).unwrap(), [255, 127, 0, 255]);
+        let rgb = (256u32 | 128 << 9 | 64 << 18 | 16 << 27).to_le_bytes();
+        assert_eq!(super::to_rgba(67, 1, 1, 4, &rgb).unwrap(), [255, 127, 63, 255]);
+    }
     #[test]
     fn readback_uses_only_the_bytes_present_in_the_last_row() {
         let mut rows = vec![0; 256 + 4];
