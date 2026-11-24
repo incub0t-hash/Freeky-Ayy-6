@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 
+use victory_shader::emit::{SLOT_IMAGE_DIMS_COUNT, SLOT_IMAGE_DIMS_INVALID};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -54,6 +55,8 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Dimensions of guest texture SRVs by title slot, independent of residency.
+    image_dims: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -482,6 +485,126 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+fn image_dimensions_word(view: Option<&View>, key: u64) -> u32 {
+    use crate::{object::{release_live, retain_live}, resource::{self, ResourceDesc}};
+
+    let (resource, srv) = match view {
+        Some(View::Shader(r, srv)) if *r != 0 => {
+            let resource = *r as crate::object::This;
+            {
+                let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                let live = views.list.get(key as u32 as usize).is_some_and(|(view, generation)| {
+                    *generation == (key >> 32) as u32
+                        && matches!(view, View::Shader(live, _) if live == r)
+                });
+                // A dropping resource acquires VIEWS before freeing its allocation.
+                if !live || !unsafe { retain_live(resource) } {
+                    return SLOT_IMAGE_DIMS_INVALID;
+                }
+            }
+            let shape = resource::texture_memory(resource).map(|(_, d)| d.image_srv_shape());
+            // SAFETY: the registry check acquired this reference.
+            unsafe { release_live(resource) };
+            let Some(shape) = shape else { return SLOT_IMAGE_DIMS_INVALID };
+            (shape, srv.as_ref().map(srv_desc))
+        }
+        Some(View::Placed(false, desc, srv)) => (
+            ResourceDesc::from_words(desc).image_srv_shape(),
+            srv[..10].try_into().ok().map(srv_desc),
+        ),
+        _ => return SLOT_IMAGE_DIMS_INVALID,
+    };
+    pack_image_dimensions(&resource, srv).unwrap_or(SLOT_IMAGE_DIMS_INVALID)
+}
+
+fn pack_image_dimensions(resource: &D3D12_RESOURCE_DESC, srv: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<u32> {
+    let dimension = resource.Dimension;
+    let width = u32::try_from(resource.Width).ok()?;
+    let height = resource.Height;
+    let layers = u32::from(resource.DepthOrArraySize);
+    let samples = resource.SampleDesc.Count;
+    if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) || layers == 0 || samples == 0 {
+        return None;
+    }
+    match dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if height == 1 && samples == 1 => {}
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {}
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D if samples == 1 => {}
+        _ => return None,
+    }
+    let extent = if dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        width.max(height).max(layers)
+    } else {
+        width.max(height)
+    };
+    let max_mips = if samples > 1 { 1 } else { extent.ilog2() + 1 };
+    let mips = match u32::from(resource.MipLevels) {
+        0 if samples == 1 => max_mips,
+        n if (1..=max_mips).contains(&n) => n,
+        _ => return None,
+    };
+    let fits = |first: u32, count: u32| count != 0 && first.checked_add(count).is_some_and(|end| end <= layers);
+    let (base, levels) = if let Some(srv) = srv {
+        // SAFETY: each union member is read only for its declared view dimension.
+        unsafe { match (dimension, srv.ViewDimension) {
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE1D) if layers == 1 => {
+                let d = srv.Anonymous.Texture1D;
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE1DARRAY) => {
+                let d = srv.Anonymous.Texture1DArray;
+                if !fits(d.FirstArraySlice, d.ArraySize) { return None; }
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2D) if samples == 1 && layers == 1 => {
+                let d = srv.Anonymous.Texture2D;
+                if d.PlaneSlice != 0 { return None; }
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY) if samples == 1 => {
+                let d = srv.Anonymous.Texture2DArray;
+                if d.PlaneSlice != 0 || !fits(d.FirstArraySlice, d.ArraySize) { return None; }
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DMS) if samples > 1 && layers == 1 => (0, 1),
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY) if samples > 1 => {
+                let d = srv.Anonymous.Texture2DMSArray;
+                if !fits(d.FirstArraySlice, d.ArraySize) { return None; }
+                (0, 1)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURE3D) => {
+                let d = srv.Anonymous.Texture3D;
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBE)
+                if width == height && samples == 1 && layers >= 6 =>
+            {
+                let d = srv.Anonymous.TextureCube;
+                if !(0.0..mips as f32).contains(&d.ResourceMinLODClamp) { return None; }
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY)
+                if width == height && samples == 1 =>
+            {
+                let d = srv.Anonymous.TextureCubeArray;
+                if !fits(d.First2DArrayFace, d.NumCubes.checked_mul(6)?)
+                    || !(0.0..mips as f32).contains(&d.ResourceMinLODClamp)
+                {
+                    return None;
+                }
+                (d.MostDetailedMip, d.MipLevels)
+            }
+            _ => return None,
+        } }
+    } else {
+        (0, u32::MAX)
+    };
+    if base > 14 || base >= mips || levels == 0 || (levels != u32::MAX && levels > mips - base) {
+        return None;
+    }
+    Some((width - 1) | ((height - 1) << 14) | (base << 28))
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -619,6 +742,17 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let image_dims = (!sampler).then(|| {
+            let bytes = u64::from(SLOT_IMAGE_DIMS_COUNT) * 4;
+            let (buffer, data) = host.upload_buffer(bytes)?;
+            // SAFETY: this is the buffer's mapped range and no list can read it yet.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0xff, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            crate::host::name(&buffer, || "image dimensions by view heap slot".to_owned());
+            Some((buffer, gpu, data as usize))
+        }).flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -632,6 +766,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            image_dims,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -785,6 +920,20 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    pub(crate) fn image_dims_table(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.image_dims.as_ref().map(|(buffer, gpu, _)| (buffer, *gpu))
+    }
+
+    fn set_image_dimensions(&self, index: u32, packed: u32) {
+        if let Some((_, _, data)) = &self.image_dims
+            && index < self.count.min(SLOT_IMAGE_DIMS_COUNT)
+        {
+            // SAFETY: a title slot in the mapping. All fields are published together
+            // in one aligned dword, as for the table of element strides.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(packed) };
+        }
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
@@ -866,7 +1015,8 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held.
+    /// made: a null view of the kind it held. The guest descriptor itself
+    /// still describes the same texture, including its dimensions.
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
@@ -1264,6 +1414,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            self.set_image_dimensions(index, SLOT_IMAGE_DIMS_INVALID);
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
@@ -1275,6 +1426,9 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            if self.image_dims.is_some() {
+                self.set_image_dimensions(index, image_dimensions_word(Some(&view), key));
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2357,6 +2511,77 @@ mod tests {
         ] {
             assert_eq!(packed_image_size(&other, &explicit(srv)), None);
         }
+    }
+
+    #[test]
+    fn image_dimensions_preserve_resource_size_and_view_base_mip() {
+        let placed = |width: u32, height: u32, layers: u32, dimension, mip| {
+            let mut resource = [0; 14];
+            resource[0] = 3; // Texture2D resource, including cubes.
+            resource[4] = width;
+            resource[6] = height;
+            resource[7] = layers | ((32 - width.max(height).leading_zeros()) << 16);
+            resource[9] = 1; // Sample count.
+            let mut srv = [0; 16];
+            srv[1] = dimension;
+            srv[4] = mip;
+            srv[5] = 1;
+            View::Placed(false, resource, srv)
+        };
+        assert_eq!(image_dimensions_word(Some(&placed(2048, 1024, 1, 4, 3)), 0), 0x30ff_c7ff);
+        assert_eq!(image_dimensions_word(Some(&placed(512, 512, 6, 9, 2)), 0), 0x207f_c1ff);
+        let View::Placed(_, resource, mut srv) = placed(512, 512, 12, 10, 2) else { unreachable!() };
+        (srv[6], srv[7]) = (6, 1); // The second cube, one cube.
+        assert_eq!(image_dimensions_word(Some(&View::Placed(false, resource, srv)), 0), 0x207f_c1ff);
+        srv[6] = 7;
+        assert_eq!(image_dimensions_word(Some(&View::Placed(false, resource, srv)), 0), u32::MAX);
+        assert_eq!(image_dimensions_word(Some(&placed(16384, 16384, 1, 4, 14)), 0), 0xefff_ffff);
+        assert_eq!(image_dimensions_word(Some(&placed(1, 1, 1, 4, 0)), 0), 0);
+        let View::Placed(_, mut resource, srv) = placed(2048, 1024, 1, 4, 3) else { unreachable!() };
+        resource[7] = 1; // Zero declared mip levels requests the full chain.
+        assert_eq!(image_dimensions_word(Some(&View::Placed(false, resource, srv)), 0), 0x30ff_c7ff);
+        assert_eq!(image_dimensions_word(Some(&placed(16385, 16384, 1, 4, 0)), 0), u32::MAX);
+        assert_eq!(image_dimensions_word(Some(&placed(2048, 1024, 1, 4, 15)), 0), u32::MAX);
+        assert_eq!(image_dimensions_word(Some(&placed(2048, 1024, 1, 9, 3)), 0), u32::MAX);
+        assert_eq!(image_dimensions_word(Some(&View::Constant(0, 256)), 0), u32::MAX);
+        assert_eq!(image_dimensions_word(None, 0), u32::MAX);
+    }
+
+    #[test]
+    fn image_dimensions_slot_follows_guest_view_mirroring() {
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let Some((_, _, data)) = heap.image_dims.as_ref() else { return };
+        let slot = 2;
+        // SAFETY: this test owns the heap; the slot is in its mapped table.
+        let read = || unsafe { (*data as *const u32).add(slot as usize).read_volatile() };
+        let mirror = |view| {
+            let [id, generation] = super::super::words_for(view);
+            let record = [VIEW_TAG, id, generation];
+            heap.mirror(slot, record.as_ptr() as u64, false);
+        };
+        let mut resource = [0; 14];
+        resource[0] = 3;
+        resource[4] = 2048;
+        resource[6] = 1024;
+        resource[7] = 1 | (12 << 16);
+        resource[9] = 1;
+        let mut srv = [0; 16];
+        srv[1] = 4;
+        srv[4] = 3;
+        srv[5] = 1;
+
+        assert_eq!(read(), u32::MAX);
+        mirror(View::Placed(false, resource, srv));
+        assert_eq!(read(), 0x30ff_c7ff);
+        mirror(View::Constant(0, 256));
+        assert_eq!(read(), u32::MAX);
+        mirror(View::Placed(false, resource, srv));
+        assert_eq!(read(), 0x30ff_c7ff);
+        heap.unmake(&mut heap.made.lock().unwrap(), slot);
+        assert_eq!(read(), 0x30ff_c7ff);
+        let empty = [0u32; 3];
+        heap.mirror(slot, empty.as_ptr() as u64, false);
+        assert_eq!(read(), u32::MAX);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

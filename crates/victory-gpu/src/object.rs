@@ -84,6 +84,25 @@ pub(crate) fn try_add_ref(this: This) -> bool {
         .is_ok()
 }
 
+/// Retains a live registry-protected object for image metadata.
+/// SAFETY: the caller holds the owning registry lock.
+#[cfg(windows)]
+pub(crate) unsafe fn retain_live(this: This) -> bool {
+    try_add_ref(this)
+}
+
+/// Releases a retained reference through the object's own destruction path.
+///
+/// # Safety
+/// The caller owns a reference to the object.
+#[cfg(windows)]
+pub(crate) unsafe fn release_live(this: This) {
+    // SAFETY: all our COM tables put Release in slot 2.
+    let f = unsafe { *(*this).functions.add(2) };
+    let release: extern "system" fn(This) -> u32 = unsafe { std::mem::transmute(f) };
+    release(this);
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

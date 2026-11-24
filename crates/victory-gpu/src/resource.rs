@@ -98,6 +98,28 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+#[cfg(windows)]
+impl ResourceDesc {
+    /// Dimensions from the guest resource declaration, before host adjustments.
+    pub(crate) fn image_srv_shape(self) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+        use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_SAMPLE_DESC};
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION(self.dimension as i32),
+            Width: self.width,
+            Height: self.height,
+            DepthOrArraySize: self.depth_or_array_size,
+            MipLevels: self.mip_levels,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: self.sample_count, Quality: self.sample_quality },
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn from_words(words: &[u32; 14]) -> Self {
+        // SAFETY: the words are a whole guest resource description; all fields are integers.
+        unsafe { words.as_ptr().cast::<Self>().read_unaligned() }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo {

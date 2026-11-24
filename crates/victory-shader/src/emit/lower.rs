@@ -51,6 +51,33 @@ enum Val {
     Missing(Why),
 }
 
+/// Bits of the first scalar operand that a shift or unsigned extract can
+/// observe, including through the SCC result. Other uses need the full word.
+fn scalar_bit_source(inst: &Inst) -> Option<(u8, u32)> {
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    let [Operand::Scalar { code, dwords: 1 }, field] = src.as_slice() else {
+        return None;
+    };
+    let field = match *field {
+        Operand::Const(c) => crate::resource::inline(c)?,
+        Operand::Literal(n) => n,
+        _ => return None,
+    };
+    let bits = match inst.name() {
+        "s_lshr_b32" => u32::MAX << (field & 31),
+        "s_lshl_b32" => u32::MAX >> (field & 31),
+        "s_bfe_u32" => {
+            let width = ((field >> 16) & 127).min(32);
+            let mask = ((1u64 << width) - 1) as u32;
+            mask << (field & 31)
+        }
+        _ => return None,
+    };
+    Some((*code, bits))
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -5668,6 +5695,9 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            if count == 8 && self.bindless_image_size(inst, site, code, address)? {
+                return Ok(());
+            }
             return self.measured_size(inst, site, code, count);
         };
         let src = Source::Loaded { load: site, first };
@@ -5804,6 +5834,139 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Reads the numeric fields of an image descriptor whose slot is used
+    /// only for dimensions. No image instruction proves a DXIL view type for
+    /// it. Expose only bits that the host can reconstruct from the guest view.
+    fn bindless_image_size(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        address: Option<Address>,
+    ) -> Result<bool, Why> {
+        let Some(a) = address else {
+            return Ok(false);
+        };
+        // A kind mismatch is only handled for pixel programs, where we can
+        // discard the pixel. Compute and mesh can require group convergence.
+        if !self.s.pixel
+            || a.offset % 32 != 0
+            || !self
+                .x
+                .native
+                .layout
+                .get(a.param)
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
+        {
+            return Ok(false);
+        }
+        if let Some(value) = a.dynamic {
+            // A scalar load may also read from inside a slot. Only read an
+            // entry of the metadata table when the address is slot-aligned.
+            let aligned = self.def_block.get(&value).is_some_and(|&b| {
+                self.x.p.blocks[b].insts.iter().any(|i| {
+                    i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::S(_)))
+                        && i.name() == "s_lshl_b32"
+                        && scalar_bit_source(i).is_some_and(|(_, bits)| bits <= u32::MAX >> 5)
+                })
+            });
+            if !aligned {
+                return Ok(false);
+            }
+        }
+        for (word, known) in [(1, 0xC000_0000), (2, 0x3FFF_FFFF), (3, 0x0000_F000)] {
+            let reg = Reg::S(code + word);
+            let Some(value) = inst.write(reg) else {
+                return Ok(false);
+            };
+            let mut observed = 0;
+            for block in &self.x.p.blocks {
+                if block.phis.iter().any(|phi| phi.args.contains(&value)) {
+                    return Ok(false);
+                }
+                for user in &block.insts {
+                    if user.reads.iter().any(|r| r.1 == value) {
+                        let Some((source, needed)) = scalar_bit_source(user) else {
+                            return Ok(false);
+                        };
+                        if user.read(Reg::S(source)) != Some(value) || needed & !known != 0 {
+                            return Ok(false);
+                        }
+                        observed |= needed;
+                    }
+                }
+            }
+            // Width, height and mip together distinguish an image size
+            // calculation from an arbitrary read of descriptor bits.
+            if observed != known {
+                return Ok(false);
+            }
+        }
+
+        use super::shader::{SLOT_IMAGE_DIMS, SLOT_IMAGE_DIMS_COUNT, SLOT_IMAGE_DIMS_INVALID};
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false)?;
+        let limit = self.s.m.i32(SLOT_IMAGE_DIMS_COUNT);
+        let zero = self.s.m.i32(0);
+        let in_table = self.s.m.cmp(c, pred::IULT, slot, limit);
+        let safe = self.s.m.select(c, in_table, slot, zero);
+        self.s.m.tag(safe, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, safe, two);
+        let handle = self.s.root_srv_handle(SLOT_IMAGE_DIMS);
+        let i32t = self.s.t.i32;
+        let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+        let undef = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let data = self.s.op(
+            c,
+            "rawBufferLoad.i32",
+            Attr::ReadOnly,
+            ret,
+            139,
+            &[handle, byte, undef, mask, align],
+        );
+        let data = self.s.m.extract(c, data, 0);
+        // The extracts establish which bits are used. The live slot, rather
+        // than the extracts, establishes whether those are image fields.
+        let invalid = self.s.m.i32(SLOT_IMAGE_DIMS_INVALID);
+        let image = self.s.m.cmp(c, pred::NE, data, invalid);
+        let valid = self.s.m.bin(c, Bin::And, in_table, image);
+        let abort = self.abort_block();
+        let c = self.s.m.new_block();
+        self.s.m.terminate(self.cur, Term::CondBr(valid, c, abort));
+        self.cur = c;
+
+        // The guest layout splits width across dwords 1 and 2, and puts
+        // height and the base mip in dwords 2 and 3, respectively.
+        let thirty = self.s.m.i32(30);
+        let d1 = self.s.m.bin(c, Bin::Shl, data, thirty);
+        let d2 = self.s.m.bin(c, Bin::LShr, data, two);
+        let width_mask = self.s.m.i32(0x0FFF);
+        let lo = self.s.m.bin(c, Bin::And, d2, width_mask);
+        let height_mask = self.s.m.i32(0x0FFF_C000);
+        let hi = self.s.m.bin(c, Bin::And, data, height_mask);
+        let d2 = self.s.m.bin(c, Bin::Or, lo, hi);
+        let sixteen = self.s.m.i32(16);
+        let mip_mask = self.s.m.i32(0xF000);
+        let d3 = self.s.m.bin(c, Bin::LShr, data, sixteen);
+        let d3 = self.s.m.bin(c, Bin::And, d3, mip_mask);
+        for (word, data) in [None, Some(d1), Some(d2), Some(d3), None, None, None, None]
+            .into_iter()
+            .enumerate()
+        {
+            let reg = Reg::S(code + word as u8);
+            if let Some(data) = data {
+                self.write(inst, reg, data, None);
+            } else if let Some(value) = inst.write(reg) {
+                self.vals.insert(value, Val::Missing("an unsupported image descriptor field"));
+                self.stale.insert(value);
+            }
+        }
+        Ok(true)
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -10654,7 +10817,7 @@ impl<'a> Lower<'a> {
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    /// The block a lane leaves through when lowering has to stop it early.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
             return a;
@@ -11232,6 +11395,77 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn image_size_from_a_bindless_descriptor_without_a_typed_use() {
+        let lower = |address_shift: u32, width_shift: u32, mip_field| {
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0x8F02_0002 | ((128 + address_shift) << 8), // s_lshl_b32 s2, s2, address_shift
+                0xF40C_0200,
+                0x0400_0000, // s_load_dwordx8 s[8:15], s[0:1], s2
+                0x9003_0009 | ((128 + width_shift) << 8), // s_lshr_b32 s3, s9, width_shift
+                0x8F04_820A, // s_lshl_b32 s4, s10, 2
+                0x9385_FF0A,
+                0x0010_000E, // s_bfe_u32 s5, s10, height field
+                0x9386_FF0B,
+                mip_field, // s_bfe_u32 s6, s11, mip field
+                0x8803_0403, // s_or_b32 s3, s3, s4
+                0x8803_0503, // s_or_b32 s3, s3, s5
+                0x8803_0603, // s_or_b32 s3, s3, s6
+                0x7E00_0203, // v_mov_b32 v0, s3
+                0xF800_1801,
+                0x0000_0000, // exp mrt0, v0, off, off, off done vm
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 2, 1)],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, false, 1).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![super::SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        let mip_field = 0x0004_000C;
+        let shader = lower(5, 30, mip_field).unwrap();
+        assert_eq!(shader.root_srvs, [super::super::SLOT_IMAGE_DIMS]);
+        assert!(lower(5, 29, mip_field).is_err(), "cannot read format bits");
+        assert!(lower(5, 30, 0x0004_0010).is_err(), "cannot read last mip");
+        assert!(lower(4, 30, mip_field).is_err(), "requires a slot-aligned read");
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

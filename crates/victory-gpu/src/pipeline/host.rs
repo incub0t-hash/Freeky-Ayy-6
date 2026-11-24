@@ -422,6 +422,7 @@ impl HostPipeline {
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_IMAGE_SIZE
+                            || slot == victory_shader::emit::SLOT_IMAGE_DIMS
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {

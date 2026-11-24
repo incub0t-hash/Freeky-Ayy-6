@@ -33,6 +33,15 @@ pub const SLOT_IMAGE_SIZE: u8 = 252;
 /// User-data marker identifying the uniform input used by SLOT_IMAGE_SIZE.
 /// The table dword is in the high 24 bits and its CBV's dword in the low 8.
 pub const USER_IMAGE_SIZE: u32 = 0x108;
+/// A raw root SRV containing the guest image dimensions by global view slot.
+/// Each dword packs width minus one and height minus one at mip zero into
+/// 14 bits each, followed by the four-bit base mip of the view.
+pub const SLOT_IMAGE_DIMS: u8 = 251;
+/// Dwords of the [`SLOT_IMAGE_DIMS`] table.
+pub const SLOT_IMAGE_DIMS_COUNT: u32 = 1 << 21;
+/// A slot that does not contain a supported image view. A 16,384-texel
+/// resource has at most 15 mips, so base mip 15 cannot be a valid view.
+pub const SLOT_IMAGE_DIMS_INVALID: u32 = u32::MAX;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

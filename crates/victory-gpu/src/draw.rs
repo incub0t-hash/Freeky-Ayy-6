@@ -1070,6 +1070,26 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_IMAGE_DIMS {
+                        let dims = self.heaps.iter().filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|heap| heap.host()?.image_dims_table());
+                        let Some((buffer, gpu)) = dims else {
+                            once!("a shader reads image dimensions from a view heap without metadata");
+                            return false;
+                        };
+                        list.keep(buffer);
+                        // SAFETY: the retained buffer supplies the internal root SRV.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
