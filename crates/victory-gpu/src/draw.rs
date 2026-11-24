@@ -186,7 +186,7 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(usize, u64, u32, u64), u32>,
     /// Guest heap objects owning cached private tables. A placed heap can
@@ -202,7 +202,7 @@ pub(crate) struct State {
     typed_dynamic: Vec<(usize, u32, u32)>,
     typed_bases: std::collections::HashSet<(usize, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) â†’ dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -2861,3 +2861,66 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 #[path = "typed_table_tests.rs"]
 mod typed_table_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With a heap map, a table whose entries lie below the identity window
+    /// is read in place, and one whose entries reach past it (its title
+    /// slots have no host slot at their own index) is made afresh in
+    /// dynamic slots, which follow the map's slot.
+    #[test]
+    fn tables_past_the_heap_maps_window_are_made_afresh() {
+        use crate::descriptor::host::{DYNAMIC, TEST_MAP};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null: This = std::ptr::null();
+        let mut heap_obj: This = null;
+        let desc = [0u32, 64, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                std::ptr::from_ref(&iid).cast(),
+                &mut heap_obj,
+            ),
+            crate::object::S_OK
+        );
+        let start = crate::descriptor::heap(heap_obj).start;
+        TEST_MAP.set(Some((16, 24)));
+        let heap = crate::descriptor::heap(heap_obj).host().expect("a host heap");
+        TEST_MAP.set(None);
+        assert_eq!(heap.count(), 16);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        // Entry 1 of the table: one descriptor past its start.
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        // A table at 2: entry 1 is title slot 3, in the window.
+        state.set_table(false, 0, start + 2 * 32);
+        assert!(state.tables(&list, &used, &[], false).is_empty(), "read in place");
+        // A table at 15: entry 1 is title slot 16, past it.
+        state.set_table(false, 0, start + 15 * 32);
+        let made = state.tables(&list, &used, &[], false);
+        assert_eq!(made.len(), 1, "made afresh");
+        let first = made[0].1 / 32;
+        assert!((25..25 + DYNAMIC).contains(&first), "{first}: a dynamic slot");
+        list.close();
+        drop(state);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
+        assert_eq!(release(heap_obj), 0);
+    }
+}
