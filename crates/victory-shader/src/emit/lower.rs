@@ -377,7 +377,7 @@ fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
     }
     let local = |i: &Inst| match &i.fields {
         Fields::Valu(v) => v.dpp.is_none() && v.sdwa.is_none()
-            && matches!(i.name(), "v_mov_b32" | "v_add_nc_u32" | "v_lshl_add_u32"
+            && matches!(i.name(), "v_mov_b32" | "v_add_nc_u32" | "v_lshl_add_u32" | "v_mul_lo_u32"
                 | "v_lshlrev_b32" | "v_lshrrev_b32" | "v_cmpx_gt_u32")
             && v.src.iter().all(|op| matches!(op, Operand::Vector { .. }
                 | Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
@@ -393,7 +393,7 @@ fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
     }
     let Some((store, before)) = fill.insts.split_last() else { return false };
     if !before.iter().all(|i| local(i) && i.name() != "v_cmpx_gt_u32")
-        || !matches!(store.name(), "buffer_store_dword" | "buffer_store_format_d16_xyzw")
+        || !matches!(store.name(), "buffer_store_dword" | "buffer_store_format_xyzw" | "buffer_store_format_d16_xyzw")
     {
         return false;
     }
@@ -417,6 +417,105 @@ fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
                     [Operand::Const(128..=208) | Operand::Literal(_)]))
         }))
     })
+}
+
+/// Buffer-only work guarded by forward EXEC-zero exits to a single return.
+/// Scalar instructions only load descriptors or compute uniform addresses.
+/// In console flow all 64 threads therefore reach each issued memory fence.
+fn predicated_buffer_work(p: &Program) -> bool {
+    let n = p.blocks.len();
+    if !(3..=4).contains(&n) || !matches!(p.blocks[n-1].insts.as_slice(), [i] if i.name() == "s_endpgm")
+        || p.blocks[n-1].exit != Exit::End { return false; }
+    let mut loads = false;
+    let mut writes = false;
+    for (b, block) in p.blocks[..n-1].iter().enumerate() {
+        let next = b + 1;
+        if next < n-1 {
+            if block.exit != (Exit::Branch { taken: n-1, not_taken: next })
+                || !matches!(block.insts.last(), Some(i) if i.name() == "s_cbranch_execz") { return false; }
+        } else if block.exit != Exit::Jump(next) { return false; }
+        for i in &block.insts {
+            let supported = match &i.fields {
+                Fields::Sopp { .. } => matches!(i.name(), "s_cbranch_execz" | "s_inst_prefetch" | "s_waitcnt" | "s_nop"),
+                Fields::Sop { dst: Some(Operand::Scalar { code: 0..=105, .. }), src, .. } =>
+                    matches!(i.name(), "s_mov_b32" | "s_mul_i32") && src.iter().all(|op|
+                        matches!(op, Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
+                Fields::Smem { .. } => i.name() == "s_load_dwordx4",
+                Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => matches!(i.name(),
+                    "v_nop" | "v_mov_b32" | "v_add_nc_u32" | "v_add3_u32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
+                    | "v_min_u32" | "v_mul_lo_u32" | "v_lshrrev_b32" | "v_lshlrev_b32" | "v_lshl_add_u32" | "v_lshl_or_b32"
+                    | "v_cmpx_gt_u32" | "v_cmpx_lt_i32" | "v_cmp_ge_u32" | "v_cmp_gt_i32" | "v_cndmask_b32"),
+                Fields::Buffer { lds: false, tfe: false, .. } => match i.name() {
+                    "buffer_load_dword" | "buffer_load_format_x" => { loads = true; true },
+                    "buffer_atomic_add" => { loads = true; writes = true; true },
+                    "buffer_store_dword" | "buffer_store_format_xyzw" => { writes = true; true },
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !supported { return false; }
+        }
+    }
+    loads && writes
+}
+
+/// A raw 16-byte initializer whose record address is a root stride times
+/// dispatch thread X. With a multiple-of-16 stride, records are disjoint or
+/// coincide exactly (including stride zero and 32-bit address wrap). Every
+/// lane writes the same tuple, so coincident records have the same result.
+fn argument_record_stride(x: &Parts<'_>) -> Option<UserData> {
+    let [block] = x.p.blocks.as_slice() else { return None };
+    if block.exit != Exit::End { return None }
+    let [before @ .., store, end] = block.insts.as_slice() else { return None };
+    if store.name()!="buffer_store_dwordx4" || end.name()!="s_endpgm" {return None}
+    let Fields::Buffer {data:Some(Operand::Vector{reg,dwords:4}),addr:Operand::Vector{reg:off,dwords:1},
+        soffset:Operand::Const(128),offset:0,offen:true,idxen:false,format:None,lds:false,tfe:false,..}=store.fields else{return None};
+    let [descriptor]=x.res.descriptors.as_slice() else{return None};
+    let [(load,address)]=x.res.scalar.as_slice() else{return None};
+    if descriptor.site!=(0,before.len()) || descriptor.role!=Role::Resource
+        || descriptor.source!=(Source::Loaded {load:*load, first:0})
+        || address.dynamic.is_some() || x.native.layout.get(address.param)?.root!=RootType::Table
+    {return None}
+    for i in before {
+        let ok=match &i.fields {
+            Fields::Sop{dst:Some(Operand::Scalar{code:0..=105,..}),..}=>i.name()=="s_mov_b32",
+            Fields::Valu(v)=>matches!(i.name(),"v_mov_b32"|"v_lshl_add_u32"|"v_mul_lo_u32")
+                && v.dpp.is_none() && v.sdwa.is_none() && v.neg==0 && v.abs==0
+                && v.opsel==0 && v.omod==0 && !v.clamp,
+            Fields::Smem{..}=>i.name()=="s_load_dwordx4",
+            _=>false,
+        };
+        if !ok {return None}
+    }
+    let def=|v:Value| before.iter().find(|i| i.writes.iter().any(|w|w.1==v));
+    let src=|i:&Inst,op:Operand| match op {
+        Operand::Vector{reg,..}=>i.read(Reg::V(reg)),
+        Operand::Scalar{code,..}=>i.read(Reg::S(code)),
+        _=>None,
+    };
+    for (k,c) in [128,129,129,128].into_iter().enumerate() {
+        let mov=def(store.read(Reg::V(reg.checked_add(k as u8)?))?)?;
+        if mov.name()!="v_mov_b32" || !matches!(&mov.fields,Fields::Valu(v) if v.src.as_slice()==[Operand::Const(c)]) {return None}
+    }
+    let mul=def(store.read(Reg::V(off))?)?;
+    let Fields::Valu(v)=&mul.fields else{return None};
+    let [stride,id]=v.src.as_slice() else{return None};
+    if mul.name()!="v_mul_lo_u32" {return None}
+    let flat=def(src(mul,*id)?)?;
+    let Fields::Valu(v)=&flat.fields else{return None};
+    let [group,Operand::Const(134),thread]=v.src.as_slice() else{return None};
+    if flat.name()!="v_lshl_add_u32" || !x.io.inputs.contains(&(src(flat,*group)?,Input::GroupId(0)))
+        || !x.io.inputs.contains(&(src(flat,*thread)?,Input::ThreadIdInGroup(0))) {return None}
+    let mut stride=src(mul,*stride)?;
+    while let Some(mov)=def(stride) {
+        let Fields::Sop{src:ops,..}=&mov.fields else{return None};
+        let [s @ Operand::Scalar{code:0..=105,..}]=ops.as_slice() else{return None};
+        if mov.name()!="s_mov_b32" {return None}
+        stride=src(mov,*s)?;
+    }
+    let &(_,param,dword)=x.res.params.iter().find(|p|p.0==stride)?;
+    let rp=x.native.layout.get(param)?;
+    (rp.root==RootType::Constants).then_some(UserData{index:u32::from(rp.user_data)+dword,slot:rp.slot,root:rp.root,dword})
 }
 
 /// A one-thread compute group can never have a second active lane. The

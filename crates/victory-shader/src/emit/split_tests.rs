@@ -432,6 +432,37 @@ fn guarded_constant_buffer_fill_declares_supported_wave_and_respects_bounds() {
     program_case("bounded constant store", &native, |t| if t < 40 { 17 } else { 0 }, true);
 }
 
+#[test]
+fn typed_offset_clear_writes_only_active_elements_across_both_halves() {
+    let mut native = program(&[], 64);
+    let mut words = vec![
+        0xbe82_0300u32, 0xbe83_0380, // table base
+        0x7da8_00a8, 0xbf88_000d, // if local index is below 40
+        0xf408_0101, 0xfa00_0000, // descriptor in s4..7
+    ];
+    for r in 1..=4 {
+        words.extend([0x7e00_02ff | r << 17, 1.0f32.to_bits()]);
+    }
+    words.extend([0xbf8c_c07f, 0xe01c_2000, 0x8001_0100, S_ENDPGM]);
+    native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    let cs = emit_for(&native, target).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    if let Ok(host) = Host::new(false)
+        && (host.target().lanes_min, host.target().lanes_max) == (32, 32)
+    {
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; cs.user_data_dwords() as usize]))],
+            views: &[View::HalfUav(64)], samplers: &[], groups: [1, 1, 1],
+        }).unwrap().remove(0);
+        assert_eq!(out.len(), 128);
+        for (i, word) in out.into_iter().enumerate() {
+            assert_eq!(word, if i < 80 { 0x3c003c00 } else { 0 }, "word {i}");
+        }
+    }
+}
+
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]
