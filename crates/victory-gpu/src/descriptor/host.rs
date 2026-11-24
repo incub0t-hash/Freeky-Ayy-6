@@ -326,9 +326,8 @@ impl HostHeap {
     /// access of `len` bytes of `buffer` from byte `offset` (a multiple of
     /// 16): a root UAV with a size, whose writes past it are dropped
     /// instead of reaching whatever the host placed after the buffer.
-    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, elements: u32) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = raw_uav_desc(offset / 4, elements);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {

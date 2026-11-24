@@ -396,6 +396,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_range(address, len, true)
+}
+
+/// A live, explicitly registered buffer that contains the whole range.
+/// This path never constructs a loose mapping from a guest pointer.
+pub(crate) fn find_named(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_range(address, len, false)
+}
+
+fn find_range(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -406,7 +416,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return allow_loose.then(|| loose(address, end)).flatten();
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {

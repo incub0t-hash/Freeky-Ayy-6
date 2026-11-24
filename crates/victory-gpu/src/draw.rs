@@ -69,10 +69,6 @@ pub(crate) struct IndexView {
 }
 
 /// What one title list has set, and what its host list was last given.
-/// The bytes of a root UAV the host brings up to date, lets the shaders
-/// write and copies back: a root view has no size of its own.
-const ROOT_UAV_BYTES: u64 = 1 << 20;
-
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -100,9 +96,23 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// Root UAVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
-    root_uav_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// A retained allocation's host address and extent distinguish guest allocations
+    /// recreated at the same guest address during command-list recording.
+    root_uav_slots: std::collections::HashMap<(usize, u64, u32), u32>,
+}
+
+fn root_uav_elements(offset: u64, bytes: u64) -> Option<u32> {
+    let n = u32::try_from(bytes / 4).ok()?;
+    (offset.is_multiple_of(16) && n != 0).then_some(n)
+}
+
+#[cfg(test)]
+#[test]
+fn root_uav_respects_allocation_length_and_raw_alignment() {
+    assert_eq!(root_uav_elements(16, 4 * (1 << 20) + 3), Some(1 << 20));
+    assert_eq!(root_uav_elements(16, 3), None);
+    assert_eq!(root_uav_elements(4, 20), None);
+    assert_eq!(root_uav_elements(0, (u64::from(u32::MAX) + 1) * 4), None);
 }
 
 impl Drop for State {
@@ -567,13 +577,8 @@ impl State {
         true
     }
 
-    /// Binds a root UAV as a one-view table: a raw view with unordered
-    /// access of the title buffer's host copy from `address`, at most
-    /// [`ROOT_UAV_BYTES`] long (a root view has no size; what the shaders
-    /// write there goes back to title memory after the submission, and a
-    /// write past it is dropped), or a null view (no address, or no host
-    /// copy). One slot per address per list. False if no dynamic slot could
-    /// be had (the draw is dropped).
+    /// Use the complete dword range of the named allocation, starting at the root address.
+    /// A root descriptor has no independent length. Unsupported bindings drop the command.
     fn root_uav_table(
         &mut self,
         list: &HostList,
@@ -591,8 +596,23 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        let Some(address) = address else { return false };
+        let backing = if address == 0 {
+            None
+        } else {
+            let Some(s) = crate::shadow::find_named(address, 4) else {
+                once!(address, "root UAV has no registered allocation covering a dword");
+                return false;
+            };
+            let offset = s.offset(address);
+            let Some(elements) = root_uav_elements(offset, s.left(address)) else {
+                once!(address, offset, "root UAV range cannot be represented by a raw view");
+                return false;
+            };
+            Some((s, offset, elements))
+        };
+        let (gpu, elements) = backing.as_ref().map_or((0, 0), |(s, _, n)| (s.gpu(address), *n));
+        let key = (std::ptr::from_ref(heap) as usize, gpu, elements);
         let index = match self.root_uav_slots.get(&key) {
             Some(&index) => index,
             None => {
@@ -601,41 +621,17 @@ impl State {
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_uav_slots.insert(key, index);
-                match &shadow {
-                    Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            let len = s.left(*a).min(ROOT_UAV_BYTES);
-                            host.raw_uav_at(index, &s.buffer, offset, len);
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every access.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root UAV not on 16 bytes is not written"
-                            );
-                            host.null_raw_uav_at(index);
-                        }
-                    }
-                    None => {
-                        if let Some(a) = address {
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root UAV outside the title's buffers is not written"
-                            );
-                        }
-                        host.null_raw_uav_at(index);
-                    }
+                match &backing {
+                    Some((s, offset, n)) => host.raw_uav_at(index, &s.buffer, *offset, *n),
+                    None => host.null_raw_uav_at(index),
                 }
                 index
             }
         };
-        if let Some((a, s)) = &shadow {
-            let len = s.left(*a).min(ROOT_UAV_BYTES);
-            s.refresh(list, *a, len);
-            s.gpu_writes(list, *a, len);
+        if let Some((s, _, n)) = &backing {
+            let len = u64::from(*n) * 4;
+            s.refresh(list, address, len);
+            s.gpu_writes(list, address, len);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
