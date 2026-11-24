@@ -23,6 +23,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+mod packed_producer;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -466,6 +469,10 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_for_dispatch(list, p, compute, None)
+    }
+
+    fn bind_for_dispatch(&mut self, list: &HostList, p: &HostPipeline, compute: bool, _groups: Option<[u32; 3]>) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -589,6 +596,12 @@ impl State {
                 if !self.root_uav_table(list, address, param, compute) {
                     return false;
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(groups) = _groups
+                && !groups.contains(&0) && p.stages.len() == 1 && packed_producer::enabled()
+            {
+                self.trace_packed_producers(&stage.shader.hash, &t.used, &made, groups);
             }
         }
         true
@@ -729,7 +742,7 @@ impl State {
             crate::pipeline::note_why("dispatch: argument record stride is missing or is not a multiple of 16".into());
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind_for_dispatch(list, p, true, Some([x, y, z])) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
