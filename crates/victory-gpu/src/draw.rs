@@ -188,7 +188,10 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(usize, u64, u32, u64), u32>,
+    /// Guest heap objects owning cached private tables. A placed heap can
+    /// share its guest addresses with another independently allocated heap.
+    table_heaps: std::collections::HashSet<usize>,
     /// Fresh slots owned by this list whose bound view is a typed R32_UINT texture UAV.
     uint_texture_views: std::collections::HashSet<(usize, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
@@ -213,6 +216,9 @@ impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in self.dynamic.iter().chain(&self.typed_dynamic) {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for heap in self.table_heaps.drain() {
+            crate::descriptor::release_heap(heap as This);
         }
     }
 }
@@ -240,6 +246,13 @@ impl State {
                 crate::descriptor::release_dynamic(heap, first, n);
             }
         }
+        let retained: std::collections::HashSet<_> = self.typed_dynamic.iter()
+            .map(|&(heap, _, _)| heap).collect();
+        self.table_heaps.retain(|heap| {
+            if retained.contains(heap) { return true; }
+            crate::descriptor::release_heap(*heap as This);
+            false
+        });
         self.typed_bases.clear();
         self.uint_texture_views.clear();
         self.fresh_tables.clear();
@@ -2018,6 +2031,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            let owner = std::ptr::from_ref(heap) as usize;
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2026,7 +2040,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, n, h.finish())
+                (owner, table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -2056,7 +2070,10 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic.push((std::ptr::from_ref(heap) as usize, first, n));
+            if self.table_heaps.insert(owner) {
+                crate::object::add_ref(owner as This);
+            }
+            self.dynamic.push((owner, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

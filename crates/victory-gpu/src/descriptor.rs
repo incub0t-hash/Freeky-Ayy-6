@@ -1024,7 +1024,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release_heap(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {
@@ -1042,7 +1042,7 @@ extern "system" fn start(this: This) -> u64 {
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<DESCRIPTOR_HEAP, 24>());
     f[0] = query as *const ();
-    f[2] = release as *const ();
+    f[2] = release_heap as *const ();
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = desc as *const (); // 0x40
     f[9] = start as *const (); // 0x48 CPU

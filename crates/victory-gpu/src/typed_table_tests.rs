@@ -93,6 +93,31 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
     assert_eq!(mask(&state, third), 1);
     assert_eq!(state.typed_table_flags(&used, 3, first, 0), 2);
     assert_eq!(state.typed_table_flags(&used, 3, second, 0), 1);
+    // Two heap objects are allowed to cover the very same guest descriptor
+    // records. Their dynamic slots belong to different host heaps.
+    let start = descriptor::heap(heap).start;
+    #[repr(C, align(8))]
+    struct PlacedHeap([u32; 8]);
+    let extended = PlacedHeap([0, 32, 1, 0, start as u32, (start >> 32) as u32, 32 * 32, 0]);
+    let mut alias = null;
+    assert_eq!(
+        descriptor::create_heap(null, extended.0.as_ptr().cast(), iid, &mut alias),
+        object::S_OK
+    );
+    let other = descriptor::heap(alias).host().unwrap();
+    let reservation = other.dynamic(20).unwrap();
+    state.set_heaps(&[alias]);
+    let aliased = bind(&mut state)[0].1;
+    assert_ne!(
+        aliased, third,
+        "the second host heap must allocate its own table"
+    );
+    assert_eq!(state.typed_table_flags(&used, 3, aliased, 0), 1);
+    state.set_heaps(&[heap]);
+    assert_eq!(bind(&mut state), [(3, third)]);
+    // The recording still uses the exact first heap after the title drops it.
+    assert_eq!(descriptor::release_heap(heap), 1);
+    other.release(reservation, 20);
     list.close();
     host.execute(&[&list]);
     state.tables_done();
@@ -108,7 +133,7 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
     );
     assert!(!state.typed_dynamic.iter().any(|&(_, i, _)| i == third / 32));
     drop(state);
-    for obj in [heap, uint, float] {
+    for obj in [alias, uint, float] {
         object::slot::<extern "system" fn(object::This) -> u32>(obj, 16)(obj);
     }
 }
