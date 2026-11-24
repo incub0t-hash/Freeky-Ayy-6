@@ -626,13 +626,16 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let Some(len) = n.checked_mul(PAGE) else { return std::ptr::null_mut(); };
+    let Some(end) = base.checked_add(len) else { return std::ptr::null_mut(); };
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    let (first, size) = changing_views(&physical, base, end);
+    let _changing = victory_gpu::title_memory_remapping_range(first, size);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -698,9 +701,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let Some(mapped_len) = len.div_ceil(PAGE).checked_mul(PAGE) else { return false; };
+    let Some(end) = to.checked_add(mapped_len) else { return false; };
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let (first, size) = changing_views(&physical, to, end);
+    let _changing = victory_gpu::title_memory_remapping_range(first, size);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -815,6 +821,21 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// Windows removes an intersecting view in its entirety. The two outer
+/// views may extend beyond the request. Interior views are already covered.
+/// The caller holds the physical map lock until all surviving ends are back.
+fn changing_views(physical: &Physical, base: usize, end: usize) -> (usize, usize) {
+    if base == end {
+        return (base, 0);
+    }
+    let first = physical.views.range(..=base).next_back()
+        .filter(|(at, (len, _))| **at + *len > base)
+        .map_or(base, |(&at, _)| at);
+    let last = physical.views.range(..end).next_back()
+        .map_or(end, |(&at, (len, _))| end.max(at + len));
+    (first, last - first)
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1136,6 +1157,12 @@ mod tests {
         let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
         assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
 
+        // Removing the middle page also removes and reinstalls both
+        // neighbours before Windows can map any of these addresses again.
+        let start = a as usize;
+        assert_eq!(changing_views(&physical(), start + PAGE, start + 2 * PAGE), (start, 3 * PAGE));
+        assert_eq!(changing_views(&physical(), start + PAGE, start + PAGE), (start + PAGE, 0));
+
         // The same page at a second address shows the same bytes.
         assert_eq!(
             XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()),
@@ -1197,18 +1224,19 @@ mod tests {
     #[test]
     fn a_read_in_place_never_meets_the_gap_of_a_remapping() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let mut pages = [0usize; 3];
-        let mut n = 3;
+        const COUNT: usize = 129;
+        let mut pages = [0usize; COUNT];
+        let mut n = COUNT;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
         let a = XMemVirtualAlloc(
             std::ptr::null_mut(),
-            3 * PAGE,
+            COUNT * PAGE,
             MEM_RESERVE | PAGES_64K,
             0,
             PAGE_READWRITE,
         );
         assert!(!a.is_null());
-        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(a, COUNT, pages.as_ptr()), a);
         // SAFETY: mapped read-write.
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
@@ -1218,7 +1246,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading();
+                    let _reading = victory_gpu::title_memory_reading_range(first, 1);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.
@@ -1228,15 +1256,17 @@ mod tests {
                 reads
             })
         };
-        for _ in 0..2000 {
-            // The same pages at the same address: the view goes and comes
-            // back, with the same bytes.
-            assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let middle = a.wrapping_byte_add(64 * PAGE);
+        for _ in 0..256 {
+            // Windows takes down the first page too when the original
+            // view is split at a different 4 MiB lock stripe.
+            assert_eq!(XMemMapPhysicalPages(middle, 1, pages[64..].as_ptr()), middle);
+            assert_eq!(XMemMapPhysicalPages(a, COUNT, pages.as_ptr()), a);
         }
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
-        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemMapPhysicalPages(a, COUNT, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(COUNT, pages.as_ptr()), 1);
     }
 
     #[test]
