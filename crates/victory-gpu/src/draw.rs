@@ -1091,6 +1091,14 @@ impl State {
         }
         let count_view = counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)));
         let count_buffer = count_view.map(|(buffer, _)| buffer);
+        #[cfg(feature = "diagnostics")]
+        let mut query = crate::capture::stage_query::Query::prepare(p, "indirect");
+        #[cfg(feature = "diagnostics")]
+        let sample_args = (&args.buffer, args.offset(arguments));
+        #[cfg(feature = "diagnostics")]
+        let sample_count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        #[cfg(feature = "diagnostics")]
+        if let Some(q) = &mut query { q.indirect_before(list, sample_args, sample_count, (kind, stride, max)); }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(
             list,
@@ -1120,7 +1128,10 @@ impl State {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         #[cfg(feature = "diagnostics")]
-        let query = crate::capture::stage_query::Query::begin(list, p, "indirect");
+        if let Some(q) = &query {
+            q.snapshot(list, sample_args, sample_count, true);
+            q.start(list);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
