@@ -419,6 +419,30 @@ fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
     })
 }
 
+/// A one-thread compute group can never have a second active lane. The
+/// argument initializers use scalar descriptor loads, per-thread moves,
+/// and a single buffer store or atomic. Reject implicit mask operands,
+/// lane operations, indirect addressing and any group synchronization.
+fn single_thread_argument_writer(p: &Program) -> bool {
+    let [block] = p.blocks.as_slice() else { return false };
+    let mut writes = 0;
+    block.exit == Exit::End && block.insts.iter().all(|i| match &i.fields {
+        Fields::Valu(v) => i.name() == "v_mov_b32" && v.dpp.is_none() && v.sdwa.is_none()
+            && v.src.iter().all(|op| matches!(op, Operand::Vector { .. }
+                | Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
+        Fields::Sop { dst: Some(Operand::Scalar { code: 0..=105, .. }), src, .. } =>
+            i.name() == "s_mov_b32" && src.iter().all(|op| matches!(op,
+                Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
+        Fields::Smem { .. } => matches!(i.name(), "s_load_dwordx4" | "s_buffer_load_dword"),
+        Fields::Buffer { lds: false, .. } if matches!(i.name(), "buffer_store_dword"
+            | "buffer_store_dwordx3" | "buffer_store_dwordx4" | "buffer_store_format_xyzw" | "buffer_atomic_add") => {
+            writes += 1;
+            true
+        }
+        _ => i.name() == "s_endpgm",
+    }) && writes == 1
+}
+
 /// Straight-line mesh exports with full EXEC. Each output is owned by one
 /// group thread. Lane reads rendezvous using a slot per thread, so they
 /// require complete virtual waves and all threads must reach them.
@@ -1306,9 +1330,10 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         if self.x.native.stage == HwStage::Cs
             && self.x.native.wave64 && !self.x.target.runs(64) && self.x.target.runs(32)
-            && self.s.threads == Some([64, 1, 1]) && self.s.lds_dwords == 0
+            && self.s.lds_dwords == 0
             && self.s.wave_size.is_none() && self.s.flags & flags::WAVE_OPS == 0
-            && bounded_constant_fill(p, self.x.res)
+            && (self.s.threads == Some([64, 1, 1]) && bounded_constant_fill(p, self.x.res)
+                || self.s.threads == Some([1, 1, 1]) && single_thread_argument_writer(p))
         {
             self.s.wave_size = Some(32);
         }

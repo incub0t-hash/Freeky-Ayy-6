@@ -10,6 +10,25 @@ use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+#[test]
+fn one_thread_argument_writer_does_not_require_a_native_wave64() {
+    let mut native = program(&[0x7e04_0281], 1);
+    // Eliminate the group/thread offset math from the general test helper.
+    // Read table descriptor to s4..7, store the constant one at byte zero.
+    let words = [0xbe82_0300u32, 0xbe83_0380, 0xf408_0101, 0xfa00_0000,
+        0x7e04_0281, 0xbf8c_c07f, 0xe070_0000, 0x8001_0200, S_ENDPGM];
+    native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    let cs = emit_for(&native, target).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    assert_eq!(wave_size(&emit_for(&native, super::Target::ANY).unwrap().dxil), None);
+    if let Ok(host) = Host::new(false)
+        && (host.target().lanes_min, host.target().lanes_max) == (32, 32)
+    {
+        assert_eq!(run(&host, &native, 1).unwrap()[0], 1);
+    }
+}
+
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
 fn wave_size(dxil: &[u8]) -> Option<u32> {
     let c = crate::Container::parse(dxil).ok()?;
