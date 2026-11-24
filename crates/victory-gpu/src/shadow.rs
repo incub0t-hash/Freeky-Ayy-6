@@ -445,6 +445,40 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
+
+/// Diagnostic lookup only: never creates a host resource.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn existing_gpu_address(
+    address: u64,
+    len: u64,
+) -> Option<u64> {
+    let end = address.checked_add(len.max(1))?;
+
+    {
+        let map = buffers();
+
+        if let Some((_, entry)) = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+        {
+            return entry.shadow.as_ref()
+                .map(|s| s.gpu(address));
+        }
+    }
+
+    let start = address & !(WINDOW - 1);
+    let aligned_end =
+        end.checked_add(WINDOW - 1)? & !(WINDOW - 1);
+    let len = aligned_end.checked_sub(start)?;
+
+    LOOSE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+        .map(|s| s.gpu(address))
+}
+
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
@@ -589,5 +623,49 @@ mod snapshot_budget_tests {
 
         assert!(!pool.is_empty());
         assert!(pool.iter().all(|v| v.is_empty()));
+    }
+}
+
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod diagnostic_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_do_not_allocate_shadow_buffers() {
+        let mem = crate::resource::Memory::zeroed(
+            64 << 10,
+            64 << 10,
+        ).unwrap();
+
+        let address = mem.address();
+        let id = usize::MAX;
+
+        register(id, address, 64 << 10);
+
+        let before = existing_gpu_address(address, 256);
+
+        let untouched = buffers()
+            .get(&(address, id))
+            .unwrap()
+            .shadow
+            .is_none();
+
+        let actual = find(address, 256);
+
+        let after = existing_gpu_address(address, 256);
+
+        unregister(id, address);
+
+        assert!(before.is_none());
+        assert!(untouched);
+
+        let actual = actual.expect("D3D12 allocation failed");
+
+        assert_eq!(after, Some(actual.gpu(address)));
+
+        assert!(
+            existing_gpu_address(u64::MAX, 256).is_none()
+        );
     }
 }
