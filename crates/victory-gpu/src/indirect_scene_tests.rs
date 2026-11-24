@@ -231,7 +231,7 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
         let (writer_root, writer) = pipeline(&producer);
         let (read_root, read) = pipeline(&consumer);
         let (out, mapped) = host.shared_buffer(115 * 4).unwrap();
-        for pass in 0..2 {
+        for pass in 0..3 {
             let list = host.new_list().unwrap();
             if pass == 0 {
                 s.refresh(&list, address, bytes.into());
@@ -250,7 +250,9 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
             let mut state = super::State::default();
             state.set_heaps(&[guest_heap]);
             state.set_table(true, 0, guest.start);
-            assert!(state.tables(&list, &[u], true, &[]).is_empty());
+            if pass == 0 {
+                assert!(state.tables(&list, &[u], true, &[]).is_empty());
+            }
             let made = state.tables(&list, &[u], true, &[(0, 8)]);
             assert_eq!(made.len(), 1);
             assert_eq!(made[0].0, 0);
@@ -273,6 +275,14 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
                 for i in 4..118 {
                     words[i] = 0xd00d0000 + i as u32;
                 }
+            } else if pass == 2 {
+                // Reusing the same guest address before submission must not
+                // refresh the retained GPU resource with the replacement's bytes.
+                crate::shadow::unregister(owner, base);
+                crate::shadow::register(owner, base, (words.len() * 4) as u64);
+                let replacement = crate::shadow::find_named(address, bytes.into()).unwrap();
+                assert!(!std::sync::Arc::ptr_eq(&s, &replacement));
+                words[4..118].fill(0xbad0cafe);
             }
             host.execute(&[&list]);
             let got = std::slice::from_raw_parts(mapped.cast::<u32>(), 115);
