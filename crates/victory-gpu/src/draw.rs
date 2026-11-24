@@ -93,6 +93,8 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// Raw SRVs owned by this list, keyed by view heap, shadow generation and byte window.
     raw_srv_views: std::collections::HashMap<(usize, Option<(usize, u64, u64)>), u32>,
+    #[cfg(feature = "diagnostics")]
+    root_srv_bindings: std::collections::HashMap<(bool, u32), (u32, Option<(u64, u64)>)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -591,7 +593,11 @@ impl State {
         compute: bool,
     ) -> bool {
         let window = address.and_then(crate::descriptor::host::root_raw_window);
-        let Some((_, handle)) = self.raw_view_slot(list, window) else { return false };
+        #[cfg(feature = "diagnostics")]
+        let range = window.as_ref().map(|w| w.gpu_range());
+        let Some((_slot, handle)) = self.raw_view_slot(list, window) else { return false };
+        #[cfg(feature = "diagnostics")]
+        self.root_srv_bindings.insert((compute, param), (_slot, range));
         // SAFETY: the slot belongs to the heap bound on this open command list.
         unsafe {
             if compute {
@@ -752,8 +758,12 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            let views = stage.root_cbvs.iter().chain(&stage.root_srvs);
-            for &(slot, _) in views.chain(&stage.root_uavs) {
+            for &(slot, param) in &stage.root_srvs {
+                let guest = self.roots_ref(compute).get(usize::from(slot));
+                let actual = self.root_srv_bindings.get(&(compute, param));
+                let _ = write!(text, " root SRV {slot} guest {guest:#x?} descriptor/range {actual:#x?}");
+            }
+            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));

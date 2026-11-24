@@ -565,6 +565,11 @@ impl ScalarWindow {
         std::sync::Arc::as_ptr(&self.shadow) as usize
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn gpu_range(&self) -> (u64, u64) {
+        (self.shadow.gpu(self.address), self.len)
+    }
+
     pub(crate) fn identity(&self) -> (usize, u64, u64) {
         (self.generation(), self.address, self.len)
     }
