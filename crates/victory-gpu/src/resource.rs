@@ -1702,6 +1702,16 @@ fn host_texture(
     texture
 }
 
+/// Whether this named title resource declares a typed R32_UINT texture UAV.
+#[cfg(windows)]
+pub(crate) fn uint_texture_uav(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let d = resource(this).desc;
+    d.dimension != BUFFER && d.format == 42 && d.flags & 4 != 0
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {

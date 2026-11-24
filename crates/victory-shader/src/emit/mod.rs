@@ -94,6 +94,8 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+#[cfg(all(test, windows))]
+mod typed_store_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -117,6 +119,35 @@ pub use shader::{
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
+
+/// Additional masks of concrete texture UAV types, after the five flags
+/// that fit in the aligned table pointer.
+pub const USER_UINT_TEXTURES: u32 = 0x104;
+
+/// The descriptor dword, mask word and bit for each fixed texture UAV.
+pub fn fixed_texture_uavs(
+    used: &[crate::UsedResource],
+    slot: u8,
+) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
+    used.iter()
+        .filter(move |u| {
+            u.kind == crate::ResourceType::Uav
+                && u.root == RootType::Table
+                && u.dwords == 8
+                && u.slot == slot
+                && u.table_offset_dwords.is_multiple_of(8)
+        })
+        .enumerate()
+        .map(|(index, u)| {
+            let i = index as u32;
+            let (word, bit) = if i < 5 {
+                (0, i)
+            } else {
+                (1 + (i - 5) / 32, (i - 5) % 32)
+            };
+            (u.table_offset_dwords, word, 1 << bit)
+        })
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

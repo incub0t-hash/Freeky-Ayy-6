@@ -1078,13 +1078,23 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot. Returns true for a successfully bound typed R32_UINT texture UAV.
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        let uint = matches!(view, View::Unordered(..))
+            && kept.as_ref().is_some_and(|r| {
+                r.as_ref().is_some_and(|r| {
+                    // SAFETY: this is the resource of the successfully created view.
+                    let d = unsafe { r.GetDesc() };
+                    d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                        && d.Format == DXGI_FORMAT_R32_UINT
+                })
+            });
         self.keep(index, kept.flatten());
+        uint
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -1831,6 +1841,12 @@ fn twin_uav(
         (other, _) => other,
     };
     Some(desc)
+}
+
+/// A candidate does not require, create or keep any host allocation. The
+/// immutable private slot supplies the authoritative type after successful creation.
+pub(crate) fn uint_texture_candidate(view: &View) -> bool {
+    matches!(view, View::Unordered(resource, _, _) if crate::resource::uint_texture_uav(*resource as crate::object::This))
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it

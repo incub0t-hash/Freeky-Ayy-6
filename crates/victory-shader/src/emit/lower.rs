@@ -2459,7 +2459,94 @@ impl<'a> Lower<'a> {
                 dword,
             },
         );
-        Val::I32(self.user_at(index))
+        let value = self.user_at(index);
+        if self.x.native.stage == HwStage::Cs
+            && rp.root == RootType::Table
+            && dword == 0
+            && super::fixed_texture_uavs(&self.x.native.used, rp.slot)
+                .next()
+                .is_some()
+        {
+            let mask = self.s.m.i32(!31);
+            return Val::I32(self.s.m.bin(self.s.entry, Bin::And, value, mask));
+        }
+        Val::I32(value)
+    }
+
+    /// The fixed window of this store has a runtime integer descriptor.
+    fn uint_image_flag(&mut self, src: &Source) -> Option<V> {
+        if self.x.native.stage != HwStage::Cs {
+            return None;
+        }
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let address = self.scalar.get(load)?;
+        let param = self.x.native.layout.get(address.param)?;
+        if address.dynamic.is_some()
+            || param.root != RootType::Table
+            || !address.offset.is_multiple_of(4)
+        {
+            return None;
+        }
+        let offset = (address.offset / 4).checked_add(u32::from(*first))?;
+        let index = u32::from(param.user_data).checked_sub(self.user_first())?;
+        let (_, page, bit) =
+            super::fixed_texture_uavs(&self.x.native.used, param.slot).find(|e| e.0 == offset)?;
+        let word = if page == 0 {
+            self.user_at(index)
+        } else {
+            self.host_word(RootType::Other(super::USER_UINT_TEXTURES), param.slot, page)
+        };
+        let mask = self.s.m.i32(bit);
+        let flag = self.s.m.bin(self.s.entry, Bin::And, word, mask);
+        let zero = self.s.m.i32(0);
+        Some(self.s.m.cmp(self.s.entry, pred::NE, flag, zero))
+    }
+
+    /// Ask for dimensions with the component type of the bound UAV. Values
+    /// cross control flow as numbers, leaving each annotated handle at its use.
+    fn view_dimensions(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+        mip: V,
+        texture_uav: bool,
+    ) -> Result<[V; 4], Why> {
+        let integer = texture_uav.then(|| self.uint_image_flag(src)).flatten();
+        let read = |l: &mut Self, props| -> Result<[V; 4], Why> {
+            let h = l.handle(site, src, false, props)?;
+            let dims =
+                l.s.m
+                    .named_struct("dx.types.Dimensions", vec![l.s.t.i32; 4]);
+            let result =
+                l.s.op(l.cur, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            Ok(std::array::from_fn(|i| {
+                l.s.m.extract(l.cur, result, i as u32)
+            }))
+        };
+        let Some(flag) = integer else {
+            return read(self, props);
+        };
+        let uint = self.s.m.new_block();
+        let float = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(self.cur, Term::CondBr(flag, uint, float));
+        self.cur = uint;
+        let a = read(self, (props.0, 0x105))?;
+        self.s.m.terminate(uint, Term::Br(join));
+        self.cur = float;
+        let b = read(self, props)?;
+        self.s.m.terminate(float, Term::Br(join));
+        self.cur = join;
+        Ok(std::array::from_fn(|i| {
+            let value = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(value, vec![(a[i], uint), (b[i], float)]);
+            value
+        }))
     }
 
     /// The user-data index that is dword 0 of the host's user data: 0, or
@@ -5630,19 +5717,14 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let mip = if image.is_some() && !uav {
             self.s.m.i32(0)
         } else {
-            self.s.m.undef(i32t)
+            self.s.m.undef(self.s.t.i32)
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+        let dims = self.view_dimensions(site, &src, props, mip, image.is_some() && uav)?;
+        let c = self.cur;
+        let field = |_: &mut Self, k: usize| dims[k];
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
@@ -9014,8 +9096,7 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
+            // The console interprets register bits according to the bound view.
             if *dmask != 0xF {
                 return Err("an image store of some channels");
             }
@@ -9045,8 +9126,24 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
-            let h = self.handle(site, src, false, props)?;
+            let integer = (!*d16).then(|| self.uint_image_flag(src)).flatten();
             let at = self.begin_guarded(guard);
+            let join = if let Some(integer) = integer {
+                let (uint, float, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(self.cur, Term::CondBr(integer, uint, float));
+                self.cur = uint;
+                let h = self.handle(site, src, false, (props.0, 0x105))?;
+                let value = self.i32_of(inst.read(Reg::V(reg)).ok_or("image store data")?)?;
+                let mut args = vec![h];
+                args.extend(&cs);
+                args.extend([value; 4]);
+                args.push(self.s.m.i8(15));
+                self.s.op(self.cur, "textureStore.i32", Attr::NoUnwind, self.s.t.void, 67, &args);
+                self.s.m.terminate(self.cur, Term::Br(join));
+                self.cur = float;
+                Some(join)
+            } else { None };
+            let h = self.handle(site, src, false, props)?;
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -9060,6 +9157,10 @@ impl<'a> Lower<'a> {
                 67,
                 &args,
             );
+            if let Some(join) = join {
+                self.s.m.terminate(self.cur, Term::Br(join));
+                self.cur = join;
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -9083,17 +9184,12 @@ impl<'a> Lower<'a> {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
-            let h = self.handle(site, src, false, props)?;
             let mip = if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
             };
-            let i32t = self.s.t.i32;
-            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-            let d = self
-                .s
-                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let dims = self.view_dimensions(site, src, props, mip, uav)?;
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
@@ -9107,7 +9203,7 @@ impl<'a> Lower<'a> {
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
-                    self.s.m.extract(c, d, ch)
+                    dims[ch as usize]
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
