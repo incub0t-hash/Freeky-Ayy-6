@@ -27,6 +27,13 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// Raw SRV of a list-held pair: the selected actual heap index and its
+/// packed image dimensions. An invalid record has a zero second word.
+pub const SLOT_IMAGE_SIZE: u8 = 252;
+/// User-data marker identifying the uniform input used by SLOT_IMAGE_SIZE.
+/// The table dword is in the high 24 bits and its CBV's dword in the low 8.
+pub const USER_IMAGE_SIZE: u32 = 0x108;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the

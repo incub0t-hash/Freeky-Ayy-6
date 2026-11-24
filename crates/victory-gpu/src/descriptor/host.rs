@@ -1331,6 +1331,17 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    pub(crate) fn image_size(&self, index: u32, key: u64, guest: &View) -> Option<u32> {
+        let made = self.made.try_lock().ok()?;
+        if key == 0 || *made.get(index as usize)? != key {
+            return None;
+        }
+        let kept = self.kept.try_lock().ok()?;
+        let resource = kept.get(index as usize)?.as_ref()?;
+        // SAFETY: the host slot retains a live reference.
+        packed_image_size(&unsafe { resource.GetDesc() }, guest)
+    }
+
     /// Reads the mirrored key and the resource it actually retains under the
     /// same lock order as mirror(). Does not create a resource or a heap.
     #[cfg(feature = "diagnostics")]
@@ -1374,6 +1385,43 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// A native size query reads the full image dimensions and applies the
+/// selected view's base mip itself. Require a single ordinary 2D image and
+/// plane zero. Video and unknown image layouts have no element mapping.
+fn packed_image_size(d: &D3D12_RESOURCE_DESC, guest: &View) -> Option<u32> {
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.DepthOrArraySize != 1
+        || d.SampleDesc.Count != 1
+        || !(1..=16384).contains(&d.Width)
+        || !(1..=16384).contains(&d.Height)
+        || crate::resource::element(d.Format.0 as u32).is_none()
+    {
+        return None;
+    }
+    let explicit: Option<&[u32]> = match guest {
+        View::Shader(_, s) => s.as_ref().map(|s| s.as_slice()),
+        View::Placed(false, resource, s) if resource[0] == d.Dimension.0 as u32 => Some(s),
+        _ => return None,
+    };
+    let levels = u32::from(d.MipLevels);
+    let mip = if let Some(s) = explicit {
+        let (first, count) = (s[4], s[5]);
+        if s[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || s[6] != 0 || s[7] != 0
+            || count == 0 || (count != u32::MAX && first.checked_add(count)? > levels)
+        {
+            return None;
+        }
+        first
+    } else {
+        0
+    };
+    if mip >= levels || mip > 14 {
+        return None;
+    }
+    // A mip <= 14 leaves the result nonzero even at the largest dimensions.
+    Some(!((d.Width as u32 - 1) | ((d.Height - 1) << 14) | (mip << 28)))
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2269,6 +2317,47 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_image_size_checks_bound_shape_and_mip() {
+        let resource = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 5808, Height: 5808, DepthOrArraySize: 1, MipLevels: 4,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let srv = [71, 4, 5768, 0, 2, 2, 0, 0, 0, 0];
+        let explicit = |srv| View::Shader(1, Some(srv));
+        let size = |view| packed_image_size(&resource, &view);
+        let packed = !(5807 | (5807 << 14) | (2u32 << 28));
+        assert_eq!(size(explicit(srv)), Some(packed));
+        assert_eq!(size(View::Shader(1, None)), Some(!(5807 | (5807 << 14))));
+        let mut placed = [0; 16];
+        placed[..10].copy_from_slice(&srv);
+        let mut image = [0; 14];
+        image[0] = 3;
+        assert_eq!(size(View::Placed(false, image, placed)), Some(packed));
+        assert_eq!(size(View::Placed(true, image, placed)), None);
+        assert_eq!(size(View::Constant(0, 32)), None);
+        assert_eq!(size(View::Unordered(1, 0, Some(srv))), None);
+        for (word, value) in [(1, 1), (1, 3), (1, 5), (1, 6), (1, 8), (1, 9),
+                              (4, 4), (5, 0), (5, 3), (6, 1), (7, 0.5f32.to_bits())] {
+            let mut other = srv;
+            other[word] = value;
+            assert_eq!(size(explicit(other)), None, "SRV dword {word} = {value}");
+        }
+        for other in [
+            D3D12_RESOURCE_DESC { DepthOrArraySize: 2, ..resource },
+            D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..resource },
+            D3D12_RESOURCE_DESC { SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 }, ..resource },
+            D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_NV12, ..resource },
+            D3D12_RESOURCE_DESC { Width: 16385, ..resource },
+            D3D12_RESOURCE_DESC { Height: 0, ..resource },
+        ] {
+            assert_eq!(packed_image_size(&other, &explicit(srv)), None);
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
