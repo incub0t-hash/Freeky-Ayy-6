@@ -985,6 +985,22 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // A missing or incompatible pipeline cannot consume a single record.
+        // In particular, do not modify its argument buffer or spend the
+        // list's work budget, which later runnable commands also use.
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        if (kind == DISPATCH) != p.compute || (kind == MESH) != p.mesh {
+            why("pipeline kind does not match the command signature");
+            return false;
+        }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            why("rectangle-list indirect draws need vertex expansion");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1019,21 +1035,14 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => self.bind(list, p, true),
             _ => false,
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
-            }
+            why("pipeline exists but its resources could not be bound");
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -1215,3 +1224,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "indirect_scene_tests.rs"]
+mod indirect_scene_tests;

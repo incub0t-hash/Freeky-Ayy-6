@@ -12,9 +12,8 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! groups per dimension and 2^20 per dispatch, the budget) cut legitimate
+//! work beyond them; raise them if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -25,7 +24,7 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint firstByte; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -37,7 +36,7 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
-    uint at = id.x * stride;
+    uint at = firstByte + id.x * stride;
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -45,26 +44,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
+    } else {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
+        cost = g.x * g.y * g.z * (kind == 2 ? 64u : 128u);
         args.Store3(at, g);
     }
+    if (cost == 0) return;
+    // Reserve only work that fits. Charging rejected work can exhaust
+    // the remaining budget or wrap the counter and admit excessive work.
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    budget.InterlockedAdd(0, 0, before);
+    [allow_uav_condition]
+    while (true) {
+        if (cost > BUDGET - before) {
+            args.Store(at, 0);
+            break;
+        }
+        uint observed;
+        budget.InterlockedCompareExchange(0, before, before + cost, observed);
+        if (observed == before) break;
+        before = observed;
     }
 }
 "#;
@@ -157,7 +160,10 @@ pub(crate) fn bound(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    // ExecuteIndirect accepts dword offsets, but a raw root UAV has a
+    // 16-byte base alignment. Keep the dword offset inside that view.
+    let first_byte = gpu % u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+    let constants = [kind, stride, records, first_byte as u32];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -166,7 +172,7 @@ pub(crate) fn bound(
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootUnorderedAccessView(1, gpu - first_byte);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
