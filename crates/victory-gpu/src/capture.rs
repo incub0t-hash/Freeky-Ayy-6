@@ -380,7 +380,12 @@ pub(crate) fn note_target(resource: crate::object::This) {
             // SAFETY: the retained host copy owns this texture.
             let desc = unsafe { copy.texture.GetDesc() };
             let flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            if desc.Width != width || desc.Height != height || (desc.Flags & flags).0 == 0 {
+            let scene_target = desc.Width == width && desc.Height == height && (desc.Flags & flags).0 != 0;
+            // These R32_UINT / RGB9E5 pairs were observed writing and sampling
+            // sky view, scattering and temporal scene color in the same scene.
+            let packed_light = matches!(desc.Format.0, 42 | 67)
+                && matches!((desc.Width, desc.Height), (192, 108) | (32, 32) | (128, 128) | (1280, 720));
+            if !scene_target && !packed_light {
                 return;
             }
         }
