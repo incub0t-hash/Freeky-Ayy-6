@@ -1248,3 +1248,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "indirect_scene_tests.rs"]
+mod indirect_scene_tests;

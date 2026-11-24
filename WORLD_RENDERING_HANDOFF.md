@@ -162,3 +162,29 @@ Next:
 - Validate textured geometry and final image composition.
 
 These synthetic tests do not establish game-world parity.
+
+## GPU-driven framebuffer checkpoint
+
+Test: indirect_scene_tests
+Exit: 101
+Log: D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-scene.log
+Image: D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-scene\frame-1.png
+
+Tests compute-generated arguments, indirect execution,
+vertex-buffer input, rasterisation and depth rejection.
+Uses native synthetic shaders, not a game executable.
+Scene retry exit=101
+
+## Scene pipeline correction
+
+Explicit valid D3D12 blend and stencil defaults.
+Pipeline test exit: 101
+Log: D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-scene-pso-fix.log
+
+## Shader linkage correction
+
+Matched vertex output and pixel input signatures.
+Added direct D3D12 InfoQueue reporting.
+
+Test exit: 0
+Log: D:\GTA 6\VIctory-Render-Reports\20261124-171243\indirect-scene-linkage.log
