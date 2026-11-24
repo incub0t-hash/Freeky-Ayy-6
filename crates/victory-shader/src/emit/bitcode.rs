@@ -305,6 +305,30 @@ impl Module {
         }
     }
 
+    /// Whether these bits are certainly a finite, integer-valued f32. Step
+    /// through representation-only casts made when a VGPR changes type.
+    pub fn is_integral_float(&self, mut v: V) -> bool {
+        loop {
+            match v {
+                V::Const(i) => {
+                    let bits = match self.consts[i as usize].1 {
+                        Const::Float(bits) => bits,
+                        Const::Int(bits) => bits as u32,
+                        _ => return false,
+                    };
+                    let f = f32::from_bits(bits);
+                    return f.is_finite() && f.fract() == 0.0;
+                }
+                V::Inst(i) => match self.insts[i as usize].op {
+                    Op::Cast(Cast::Bitcast, x) => v = x,
+                    Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => return true,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
