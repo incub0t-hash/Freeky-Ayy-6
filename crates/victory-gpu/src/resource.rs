@@ -283,7 +283,8 @@ fn host_lacks_target(format: u32) -> bool {
             )
         };
         let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
-        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        let typed_stores = support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed || !typed_stores;
         if lacks {
             tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
         }
@@ -591,9 +592,11 @@ impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height).div_ceil(block).checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        let pitch = u64::from(self.row_pitch);
+        if last == 0 || last > pitch { return None; }
+        pitch.checked_mul(lines.checked_sub(1)?)?.checked_add(last)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
