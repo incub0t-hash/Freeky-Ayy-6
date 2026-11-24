@@ -248,6 +248,31 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn log_video_memory(device: &ID3D12Device) {
+    // The DXGI budget and usage apply to the calling process and adapter.
+    // Query the adapter of the running device, including when WARP is selected.
+    static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
+    // SAFETY: a live device and factory, and caller-owned query output.
+    unsafe {
+        let adapter = ADAPTER.get_or_init(|| {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()
+        });
+        let Some(adapter) = adapter else { return };
+        for (segment, group) in [
+            ("local", DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+            ("non-local", DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL),
+        ] {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            if adapter.QueryVideoMemoryInfo(0, group, &mut info).is_ok() {
+                tracing::info!(segment, usage_bytes = info.CurrentUsage, budget_bytes = info.Budget,
+                    reservation_bytes = info.CurrentReservation, "DXGI process video memory");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,6 +1643,9 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                if let Some(host) = host() {
+                    log_video_memory(&host.device);
+                }
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

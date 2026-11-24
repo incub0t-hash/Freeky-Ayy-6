@@ -208,6 +208,8 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::capture::first_bind(&shader.hash);
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }

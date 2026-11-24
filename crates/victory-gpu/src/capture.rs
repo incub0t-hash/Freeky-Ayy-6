@@ -4,6 +4,8 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -16,8 +18,23 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// Presentation count at the first bind of the requested shader.
+static FIRST_BIND_PRESENT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub(crate) fn first_bind(hash: &str) {
+    static SHADER: OnceLock<Option<String>> = OnceLock::new();
+    if SHADER.get_or_init(|| std::env::var("VICTORY_CAPTURE_BIND").ok()).as_deref() == Some(hash) {
+        let at = crate::queue::presented();
+        if FIRST_BIND_PRESENT
+            .compare_exchange(u64::MAX, at, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::info!(hash, presented = at, "capture anchor bound");
+        }
+    }
+}
+
+/// Capture explicitly listed frames and offsets relative to the first bind.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
@@ -26,7 +43,12 @@ pub(crate) fn listed(n: u64) -> bool {
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     })
-    .contains(&n)
+    .contains(&n) || n.checked_sub(FIRST_BIND_PRESENT.load(Ordering::Relaxed)).is_some_and(|offset| {
+        static OFFSETS: OnceLock<Vec<u64>> = OnceLock::new();
+        OFFSETS.get_or_init(|| std::env::var("VICTORY_CAPTURE_OFFSETS").unwrap_or_else(|_| "2".into())
+            .split(',').filter_map(|v| v.trim().parse().ok()).filter(|&v| v > 0).collect())
+            .contains(&offset)
+    })
 }
 
 /// Whether frame `n` is saved.
@@ -119,6 +141,9 @@ pub(crate) fn read_back(
             Some(&mut total),
         );
     }
+    if total == 0 || total > isize::MAX as u64 {
+        return None;
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
@@ -191,9 +216,11 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        if rows_fit(f.Width as usize, f.Height as usize, 4, f.RowPitch as usize, len) {
+            save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        }
         buffer.Unmap(0, None);
     }
 }
@@ -280,7 +307,7 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
@@ -315,12 +342,18 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
+fn rows_fit(w: usize, h: usize, pixel: usize, pitch: usize, len: usize) -> bool {
+    let Some(bytes) = w.checked_mul(pixel) else { return false };
+    w > 0 && h > 0 && bytes <= pitch &&
+        (h - 1).checked_mul(pitch).and_then(|at| at.checked_add(bytes)).is_some_and(|end| end <= len)
+}
+
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
+    let output_size = w.checked_mul(h)?.checked_mul(4)?;
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
@@ -328,6 +361,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            if !rows_fit(w, h, 4, pitch, rows.len()) { return None; }
+            let mut out = Vec::with_capacity(output_size);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -338,6 +373,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
+            if !rows_fit(w, h, 4, pitch, rows.len()) { return None; }
+            let mut out = Vec::with_capacity(output_size);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -372,12 +409,14 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
-    let values: Vec<[f32; 3]> = (0..h)
+    if !rows_fit(w, h, n, pitch, rows.len()) { return None; }
+    // Scan twice: retaining three floats per pixel just to normalize a 4K
+    // target would consume another 95 MiB during the capture.
+    let values = || (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
-        .map(|(x, y)| decode(px(x, y, n)))
-        .collect();
+        .map(|(x, y)| decode(px(x, y, n)));
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
+    let finite = values().flatten().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
     } else {
@@ -385,7 +424,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     };
     let range = (high - low).max(1e-20);
     tracing::info!(format, low, high, "target values");
-    for v in values {
+    let mut out = Vec::with_capacity(output_size);
+    for v in values() {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
@@ -520,6 +560,15 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readback_uses_only_the_bytes_present_in_the_last_row() {
+        let mut rows = vec![0; 256 + 4];
+        rows[256..].copy_from_slice(&[11, 22, 33, 255]);
+        assert_eq!(super::to_rgba(28, 1, 2, 256, &rows).unwrap()[4..], [11, 22, 33, 255]);
+        assert!(super::to_rgba(28, 1, 2, 256, &rows[..259]).is_none());
+        assert!(super::to_rgba(10, 1, 2, 256, &rows).is_none());
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
