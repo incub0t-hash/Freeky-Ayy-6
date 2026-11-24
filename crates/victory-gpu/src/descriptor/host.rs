@@ -385,19 +385,37 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
+        self.retire_dynamic(first, n, |indices| {
+            for index in indices {
+                self.forget_view(index);
+            }
+        });
+    }
+
+    /// Retire metadata before publishing slots as available.
+    /// The caller owns the range until retirement completes.
+    fn retire_dynamic(
+        &self,
+        first: u32,
+        n: u32,
+        cleanup: impl FnOnce(std::ops::Range<u32>),
+    ) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+
+        let end = at.saturating_add(n).min(self.dynamic);
+
+        if at >= end {
+            return;
+        }
+
+        // The allocation bitmap still marks this range occupied.
+        cleanup(first..self.count + end);
+
+        // Only now may another recording thread reuse these slots.
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
-        drop(guard);
-        // Their raw views go back too: the list that read them is done.
-        for index in first..first.saturating_add(n).min(self.alias_base) {
-            self.forget_view(index);
-        }
+        guard.1[at as usize..end as usize].fill(false);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1448,5 +1466,42 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+}
+
+
+#[cfg(test)]
+mod retirement_regression {
+    use super::*;
+
+    #[test]
+    fn slots_are_unavailable_until_cleanup_finishes() {
+        let heap = HostHeap::new(false, 8)
+            .expect("Host descriptor heap");
+
+        let first = heap.dynamic(1)
+            .expect("Initial allocation");
+
+        // Simulate complete allocation pressure.
+        {
+            let mut guard = heap.next.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.1.fill(true);
+        }
+
+        heap.retire_dynamic(first, 1, |range| {
+            assert_eq!(range, first..first + 1);
+
+            assert!(
+                heap.dynamic(1).is_none(),
+                "Slot became available before cleanup completed"
+            );
+        });
+
+        assert_eq!(
+            heap.dynamic(1),
+            Some(first),
+            "Retired slot was not returned to the allocator"
+        );
     }
 }
