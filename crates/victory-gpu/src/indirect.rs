@@ -77,20 +77,20 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Clamp {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+pub(crate) struct ComputePass {
+    pub(crate) root: ID3D12RootSignature,
+    pub(crate) pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for Clamp {}
+unsafe impl Send for ComputePass {}
 // SAFETY: as above.
-unsafe impl Sync for Clamp {}
+unsafe impl Sync for ComputePass {}
 
-fn clamp() -> Option<&'static Clamp> {
-    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+fn clamp() -> Option<&'static ComputePass> {
+    static CLAMP: std::sync::OnceLock<Option<ComputePass>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match compile_pass(SOURCE) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -100,16 +100,16 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+pub(crate) fn compile_pass(source: &str) -> windows::core::Result<ComputePass> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            s!("host compute pass"),
             None,
             None,
             s!("main"),
@@ -126,7 +126,7 @@ fn make() -> windows::core::Result<Clamp> {
             let text = unsafe {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::warn!("host compute pass: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -143,7 +143,7 @@ fn make() -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(ComputePass { root, pso })
     }
 }
 

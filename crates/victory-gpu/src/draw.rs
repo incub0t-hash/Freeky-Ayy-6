@@ -93,6 +93,10 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// Raw SRVs owned by this list, keyed by view heap, shadow generation and byte window.
     direct_raw_views: std::collections::HashMap<(usize, Option<(usize, u64, u64)>), u32>,
+    #[cfg(feature = "diagnostics")]
+    sample_cull: bool,
+    #[cfg(feature = "diagnostics")]
+    cull_inputs: Option<crate::capture::cull_indices::Inputs>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -520,6 +524,9 @@ impl State {
                 }
                 #[cfg(feature = "diagnostics")]
                 if compute {
+                    if self.sample_cull && crate::capture::cull_indices::supported(&stage.shader.hash) {
+                        self.cull_inputs = self.cull_inputs_for(&values);
+                    }
                     self.trace_compute_bindings(&stage.shader.hash, &t.used, &made, &values, &t.host);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -767,6 +774,41 @@ impl State {
         self.dynamic.push((heap_id, slot, 1));
         self.direct_raw_views.insert(key, slot);
         Some(slot)
+    }
+
+    /// These two compiled programs have T77 at table dword 8 and the private
+    /// raw heap SRV at user dword 6. Verify both host descriptors share the
+    /// same resource and neither declared output UAV can alter the records.
+    #[cfg(feature = "diagnostics")]
+    fn cull_inputs_for(&self, values: &[u32]) -> Option<crate::capture::cull_indices::Inputs> {
+        if self.compute_constant(1, 1) != Some(17) {
+            return None;
+        }
+        let &Root::Table(table) = self.compute.first()? else { return None };
+        let host = self.heap_of(table)?.host()?;
+        let base = *values.get(4)? / 32;
+        let private = *values.get(6)?;
+        let scene = host.retained_resource(private)??;
+        let table_srv = host.retained_resource(base.checked_add(1)?)??;
+        if table_srv != scene {
+            return None;
+        }
+        for i in [3, 4] {
+            if host.retained_resource(base.checked_add(i)?)?? == scene {
+                return None;
+            }
+        }
+        let ((_, window), _) = self.direct_raw_views.iter()
+            .find(|((heap, _), alias)| *heap == self.heaps[0] && **alias == private)?;
+        let (_, start, scene_len) = (*window)?;
+        let (_, (_, scene_offset)) = crate::shadow::bound_range(&scene, start, scene_len)?;
+        let view = crate::descriptor::view(table.checked_add(32)?)?;
+        let (param, n) = crate::descriptor::host::buffer_range(&view)?;
+        if n != 456 {
+            return None;
+        }
+        let (_, (_, param_offset)) = crate::shadow::bound_range(&table_srv, param, n)?;
+        Some(crate::capture::cull_indices::Inputs { resource: scene, param_offset, scene_offset, scene_len })
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
@@ -1254,11 +1296,20 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.sample_cull = query.as_ref().is_some_and(|q| q.wants_cull());
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
+        };
+        #[cfg(feature = "diagnostics")]
+        let cull = {
+            self.sample_cull = false;
+            self.cull_inputs.take()
         };
         if !ran {
             crate::indirect::done(list, &args.buffer, count_buffer);
@@ -1286,9 +1337,13 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        #[cfg(feature = "diagnostics")]
-        if let Some(query) = query { query.end(list) }
         crate::indirect::done(list, &args.buffer, count_buffer);
+        #[cfg(feature = "diagnostics")]
+        if let Some(query) = query
+            && query.end_with_cull(list, cull.as_ref().map(|i| (i, sample_args))) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
