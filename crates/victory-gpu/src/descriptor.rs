@@ -59,7 +59,7 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     trace_serial: u64,
 }
 
@@ -126,7 +126,7 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) mod observation {
     use super::*;
 
@@ -163,6 +163,32 @@ pub(crate) mod observation {
     }
 
     impl BoundHeap {
+        /// Resolve one fixed, slot-aligned table entry in this bound view heap.
+        pub(crate) fn table_entry(self, table: u64, dword: u32) -> Option<u64> {
+            while_live(self.0, |heap| {
+                let first = heap.index(table)?;
+                if heap.trace_serial != self.1 || heap.handle(first)? != table || dword % 8 != 0 {
+                    return None;
+                }
+                heap.handle(first.checked_add(dword / 8)?)
+            })?
+        }
+
+        /// Only the live slot whose guest key agrees with its host resource
+        /// can supply native width, height and base mip.
+        pub(crate) fn image_size(self, index: u32) -> Option<u32> {
+            while_live(self.0, |heap| {
+                if heap.trace_serial != self.1 {
+                    return None;
+                }
+                let handle = heap.handle(index)?;
+                let (key, guest) = view(handle)?;
+                let packed = heap.host.get()?.as_ref()?.image_size(index, key, &guest)?;
+                (view(handle)?.0 == key).then_some(packed)
+            })?
+        }
+
+        #[cfg(feature = "diagnostics")]
         pub(crate) fn slot(self, index: u32) -> String {
             while_live(self.0, |heap| {
                 if heap.trace_serial != self.1 {
@@ -1003,7 +1029,7 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         trace_serial: {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1051,7 +1077,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -1065,6 +1091,14 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn visible_heap(count: u32) -> This {
+        let mut heap = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut heap), S_OK);
+        heap
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn puddle_observation_respects_guest_heap_extent_identity_and_lifetime() {
@@ -1073,6 +1107,12 @@ mod tests {
         assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
         let bound = observation::bound_heap(h as usize).unwrap();
         let handle = heap(h).handle(2).unwrap();
+        let start = heap(h).handle(0).unwrap();
+        assert_eq!(bound.table_entry(start, 16), Some(handle));
+        assert_eq!(bound.table_entry(start, 24), None);
+        assert_eq!(bound.table_entry(start + 1, 0), None);
+        assert_eq!(bound.table_entry(start, 1), None);
+        assert_eq!(bound.image_size(2), None);
         let mut resource = [0u32; 14];
         (resource[0], resource[4], resource[6], resource[7], resource[8]) =
             (3, 96, 64, 1 | (6 << 16), 28);
@@ -1092,6 +1132,8 @@ mod tests {
         assert_ne!(observation::view(handle).unwrap().0, key);
         assert_eq!(release(h), 0);
         assert!(bound.slot(2).contains("released"));
+        assert_eq!(bound.table_entry(start, 0), None);
+        assert_eq!(bound.image_size(2), None);
     }
 
     #[test]

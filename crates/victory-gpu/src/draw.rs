@@ -686,6 +686,10 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_IMAGE_SIZE {
+            // Its slot and offset describe the private image-size SRV binding.
+            return 0;
+        }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
             // (`root_uav`, `root_srv_table`).
@@ -737,6 +741,47 @@ impl State {
             }
         }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
+    }
+
+    /// Capture the shader's proven uniform CBV selector at submission.
+    /// Freeze its slot and actual view dimensions until GPU completion.
+    pub(crate) fn bind_image_size(&self, list: &HostList, user: &[victory_shader::emit::UserData]) -> Option<u64> {
+        use crate::descriptor::observation;
+        let input = user.iter().find(|u| {
+            u.root == RootType::Other(victory_shader::emit::USER_IMAGE_SIZE)
+        })?;
+        let Root::Table(table) = self.graphics.get(usize::from(input.slot))? else {
+            return None;
+        };
+        let heap = observation::bound_heap(self.heaps[0])?;
+        let handle = heap.table_entry(*table, input.dword >> 8)?;
+        let (key, View::Constant(address, size)) = observation::view(handle)? else {
+            return None;
+        };
+        let offset = (input.dword & 255) * 4;
+        if address == 0 || offset + 4 > size {
+            return None;
+        }
+        let address = address.checked_add(u64::from(offset))?;
+        address.checked_add(4)?;
+        let (gpu, to) = list.scratch(8)?;
+        // SAFETY: the list just allocated these eight aligned bytes for this draw.
+        unsafe { to.cast::<u64>().write(0) };
+        list.defer_fill(to, address as *const u8, 4);
+        let destination = to as usize;
+        list.defer_host(move || {
+            // SAFETY: both aligned dwords belong to the list through completion.
+            let words = destination as *mut u32;
+            let index = unsafe { words.read() };
+            let mut source = [0; 4];
+            let valid = crate::host::read_into(address as *const u8, &mut source)
+                && u32::from_le_bytes(source) == index
+                && observation::view(handle).is_some_and(|(current, _)| current == key);
+            let packed = valid.then(|| heap.image_size(index)).flatten().unwrap_or(0);
+            // SAFETY: the second dword of the same upload allocation.
+            unsafe { words.add(1).write(packed) };
+        });
+        Some(gpu)
     }
 
     /// The bound heap holding `handle`.
@@ -949,6 +994,12 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_IMAGE_SIZE {
+                        let Some(gpu) = self.bind_image_size(list, &t.host.user_data) else { return false };
+                        // SAFETY: a pixel-only root SRV of two dwords in list-held memory.
+                        unsafe { l.SetGraphicsRootShaderResourceView(param, gpu) };
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {

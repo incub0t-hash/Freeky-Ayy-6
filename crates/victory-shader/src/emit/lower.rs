@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "image_size.rs"]
+mod image_size;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -5578,7 +5581,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            return self.measured_size(inst, site, code, count);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);

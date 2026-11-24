@@ -4972,6 +4972,16 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// Locate a list-owned allocation for a hardware readback assertion.
+    #[cfg(test)]
+    pub(crate) fn scratch_resource(&self, gpu: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+        let s = self.scratch.lock().unwrap();
+        s.chunks.iter().find_map(|(chunk, size)| {
+            let offset = gpu.checked_sub(chunk.gpu)?;
+            (offset.checked_add(len)? <= *size).then(|| (chunk._buffer.clone(), offset))
+        })
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {

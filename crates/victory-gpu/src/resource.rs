@@ -2296,7 +2296,11 @@ mod tests {
         crate::descriptor::create_srv(null, resource, &desc, handle);
         let (key, view) = crate::descriptor::observation::view(handle).unwrap();
         assert_eq!(view, crate::descriptor::View::Shader(resource as usize, Some(desc)));
-        assert_eq!(heap.mirror(2, handle, true), Some(view));
+        assert_eq!(heap.mirror(2, handle, true), Some(view.clone()));
+        assert_eq!(heap.image_size(2, key, &view), Some(!(95 | (63 << 14) | (2u32 << 28))));
+        assert_eq!(heap.image_size(2, key ^ (1 << 32), &view), None);
+        assert_eq!(heap.image_size(1, key, &view), None);
+        assert_eq!(heap.image_size(3, key, &view), None);
         let (mirrored, description) = heap.observed_slot(2).unwrap();
         assert_eq!(mirrored, key);
         let description = description.expect("the mirrored view retained a real resource");
@@ -2304,6 +2308,62 @@ mod tests {
         assert_eq!(heap.observed_slot(3), Err("outside host heap"));
         drop(heap);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_image_size_submission_freezes_each_draws_actual_texture() {
+        use crate::{descriptor, draw, host};
+        use victory_shader::{RootType, emit::{USER_IMAGE_SIZE, UserData}};
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &texture(96, 64, 28, 6),
+            0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let object = descriptor::tests::visible_heap(12);
+        let heap = descriptor::heap(object);
+        let mirror = heap.host().expect("real view heap");
+        let entry = |index| heap.handle(index).unwrap();
+        let desc = [28, 4, 5768, 0, 2, 3, 0, 0, 0, 0];
+        descriptor::create_srv(null, image, &desc, entry(2));
+        mirror.mirror(2, entry(2), true).expect("real mirrored texture");
+        let mut material = [1u32; 4];
+        let address = material.as_mut_ptr() as u64;
+        descriptor::create_cbv(null, &[address as u32, (address >> 32) as u32, 16, 0], entry(9));
+        let mut state = draw::State::default();
+        state.set_heaps(&[object]);
+        state.set_table(false, 1, entry(0));
+        let input = [UserData { index: 0, slot: 1, dword: 72 << 8, root: RootType::Other(USER_IMAGE_SIZE) }];
+        let host = host::host().expect("D3D12 adapter");
+        let list = host.new_list().expect("direct list");
+        let back = host.read_back_buffer(24).expect("readback");
+        let draw = |offset| {
+            let gpu = state.bind_image_size(&list, &input).expect("bound size record");
+            let (resource, source) = list.scratch_resource(gpu, 8).expect("list-held size record");
+            // SAFETY: the list owns the source until completion; the destination has three records.
+            unsafe { list.list.CopyBufferRegion(&back, offset, &resource, source, 8) };
+        };
+        let good = 2u32;
+        let absent = 5u32;
+        let outside = 12u32;
+        let select = |index: &u32| list.defer_copy(address as *mut u8, std::ptr::from_ref(index).cast(), 4);
+        select(&good);
+        draw(0);
+        select(&absent);
+        draw(8);
+        select(&outside);
+        draw(16);
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the queue completed the three records copied to this readback.
+        unsafe {
+            back.Map(0, None, Some(&mut mapped)).expect("map readback");
+            let records = mapped.cast::<[u32; 6]>().read_unaligned();
+            back.Unmap(0, None);
+            assert_eq!(records, [2, !(95 | (63 << 14) | (2u32 << 28)), 5, 0, 12, 0]);
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
     }
 
     fn heap(size: u64) -> This {
