@@ -186,9 +186,15 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Fresh slots owned by this list whose bound view is a typed R32_UINT texture UAV.
+    uint_texture_views: std::collections::HashSet<(usize, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Tables whose concrete types were recorded in shader root constants.
+    /// Replaying those constants still needs the same descriptor generation.
+    typed_dynamic: Vec<(usize, u32, u32)>,
+    typed_bases: std::collections::HashSet<(usize, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -202,7 +208,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for &(heap, first, n) in self.dynamic.iter().chain(&self.typed_dynamic) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -225,8 +231,14 @@ impl State {
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
         for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+            if self.typed_bases.contains(&(heap, first)) {
+                self.typed_dynamic.push((heap, first, n));
+            } else {
+                crate::descriptor::release_dynamic(heap, first, n);
+            }
         }
+        self.typed_bases.clear();
+        self.uint_texture_views.clear();
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -922,6 +934,12 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if u.root == RootType::Other(victory_shader::emit::USER_UINT_TEXTURES) {
+                        if let Some(&(_, base)) = made.iter().find(|m| m.0 == u.slot) {
+                            values[u.index as usize] = self.typed_table_flags(&t.used, u.slot, base, u.dword);
+                        }
+                        continue;
+                    }
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
@@ -931,7 +949,14 @@ impl State {
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
+                        Some(&(_, offset)) if compute && u.dword == 0 => {
+                            offset | self.typed_table_flags(&t.used, u.slot, offset, 0)
+                        }
                         Some(&(_, offset)) => offset,
+                        None if compute && u.root == RootType::Table && u.dword == 0
+                            && victory_shader::emit::fixed_texture_uavs(&t.used, u.slot).next().is_some() => {
+                            self.user_value(compute, u.slot, u.root, u.dword) & !31
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1853,6 +1878,29 @@ impl State {
         }
     }
 
+    fn typed_table_flags(&mut self, used: &[UsedResource], slot: u8, base: u32, page: u32) -> u32 {
+        let mask = self.fixed_uint_mask(used, slot, base, page);
+        if mask != 0 {
+            self.typed_bases.insert((self.heaps[0], base / 32));
+        }
+        mask
+    }
+
+    /// The concrete UAV and this table remain retained until list reset. Mark
+    /// only a typed R32_UINT UAV of the exact host texture in the private slot.
+    fn fixed_uint_mask(&self, used: &[UsedResource], slot: u8, base: u32, page: u32) -> u32 {
+        let mut mask = 0;
+        for (dword, word, bit) in victory_shader::emit::fixed_texture_uavs(used, slot) {
+            if word == page
+                && let Some(index) = (base / 32).checked_add(dword / 8)
+                && self.uint_texture_views.contains(&(self.heaps[0], index))
+            {
+                mask |= bit;
+            }
+        }
+        mask
+    }
+
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
@@ -1895,7 +1943,15 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            // Float-only tables keep the normal in-place path. Snapshot a table
+            // when a supported fixed texture slot has a real integer resource.
+            let uint = compute && !heap.samplers() && (table - heap.start).is_multiple_of(32)
+                && u.kind == ResourceType::Uav && u.dwords == 8
+                && victory_shader::emit::fixed_texture_uavs(used, u.slot)
+                    .any(|(offset, _, _)| offset == u.table_offset_dwords)
+                && crate::descriptor::view(end).as_ref()
+                    .is_some_and(crate::descriptor::host::uint_texture_candidate);
+            if index >= host.count() || uint {
                 fresh.push(u.slot);
             }
         }
@@ -1994,8 +2050,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -2014,7 +2069,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if host.make_at(index, &view) {
+                            self.uint_texture_views.insert((self.heaps[0], index));
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -2690,3 +2747,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(test)]
+#[path = "typed_table_tests.rs"]
+mod typed_table_tests;
