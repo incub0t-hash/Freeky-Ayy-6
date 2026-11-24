@@ -109,7 +109,115 @@ pub(super) fn heap_raw_loads(n: &NativeProgram, p: &Program, res: &Resources) ->
     loads
 }
 
-#[cfg(test)]
+/// A root constant can be rebound to a command-list-local host slot only if
+/// every use of its value is the guest view index multiplied by 32 and every
+/// use of that result loads the identical four-dword raw buffer descriptor.
+pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) -> Vec<u32> {
+    use crate::gfx10::Operand;
+    use crate::ir::{Reg, Value};
+    let raw = heap_raw_loads(n, p, res);
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut raw_loads = BTreeSet::new();
+    let mut excluded = BTreeSet::new();
+    for d in &res.descriptors {
+        let inst = &p.blocks[d.site.0].insts[d.site.1];
+        let eligible = d.role == Role::Resource
+            && matches!(d.source, Source::Loaded { first: 0, .. })
+            && (raw.contains(&d.site)
+                || (inst.name().starts_with("buffer_load_dword")
+                    && matches!(
+                        inst.fields,
+                        Fields::Buffer {
+                            idxen: false,
+                            format: None,
+                            ..
+                        }
+                    )));
+        for leaf in d.source.leaves() {
+            if let Source::Loaded { load, .. } = leaf {
+                if eligible {
+                    raw_loads.insert(*load);
+                } else {
+                    excluded.insert(*load);
+                }
+            }
+        }
+    }
+    let mut uses = BTreeMap::<Value, Vec<Option<Site>>>::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            for v in &phi.args {
+                uses.entry(*v).or_default().push(None);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.reads {
+                uses.entry(v).or_default().push(Some((b, i)));
+            }
+        }
+    }
+    let addresses: BTreeMap<_, _> = res.scalar.iter().copied().collect();
+    let mut indices = BTreeSet::new();
+    for &(value, param, dword) in &res.params {
+        let root = &n.layout[param];
+        if root.root != RootType::Constants {
+            continue;
+        }
+        let Some(uses_of_value) = uses.get(&value) else {
+            continue;
+        };
+        let all_raw = uses_of_value.iter().all(|site| {
+            let Some((b, i)) = *site else { return false };
+            let shift = &p.blocks[b].insts[i];
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: out, .. }),
+                src,
+                ..
+            } = &shift.fields
+            else {
+                return false;
+            };
+            let [Operand::Scalar { code: input, .. }, Operand::Const(133)] = src.as_slice() else {
+                return false;
+            };
+            if shift.name() != "s_lshl_b32"
+                || shift.read(Reg::S(*input)) != Some(value)
+                || shift
+                    .write(Reg::Scc)
+                    .is_some_and(|scc| uses.contains_key(&scc))
+            {
+                return false;
+            }
+            let Some(bytes) = shift.write(Reg::S(*out)) else {
+                return false;
+            };
+            uses.get(&bytes).is_some_and(|reads| {
+                reads.iter().all(|site| {
+                    let Some(site) = site else { return false };
+                    let inst = &p.blocks[site.0].insts[site.1];
+                    raw_loads.contains(site)
+                        && !excluded.contains(site)
+                        && inst.name() == "s_load_dwordx4"
+                        && addresses.get(site).is_some_and(|a| {
+                            a.offset == 0
+                                && a.dynamic == Some(bytes)
+                                && n.layout
+                                    .get(a.param)
+                                    .is_some_and(|r| r.root == RootType::ResourceHeap)
+                        })
+                })
+            })
+        });
+        if all_raw {
+            indices.insert(u32::from(root.user_data) + dword);
+        }
+    }
+    indices.into_iter().collect()
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::emit::{
@@ -198,6 +306,41 @@ mod tests {
                 .scalar_raw_srvs
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn direct_raw_indices_require_exclusive_root_index_use() {
+        for (extra, shift, expected) in [
+            (false, 0x8f09_8502u32, true),
+            (true, 0x8f09_8502u32, false),
+            (false, 0x8f09_8402u32, false),
+        ] {
+            let mut n = native(RootType::ResourceHeap, true);
+            n.layout.push(RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 2,
+            });
+            let StageIo::Cs(ref mut io) = n.io else {
+                unreachable!()
+            };
+            io.rsrc2 = 3 << 1;
+            n.code[12..16].copy_from_slice(&0x1200_0000u32.to_le_bytes()); // descriptor offset in s9
+            let mut prefix = shift.to_le_bytes().to_vec();
+            if extra {
+                prefix.extend(0xbe8a_0302u32.to_le_bytes());
+            } // s10 = s2 is a second use
+            prefix.append(&mut n.code);
+            n.code = prefix;
+            let shader = emit_for(&n, Target::ANY).unwrap();
+            assert_eq!(
+                shader.direct_raw_indices,
+                if expected { vec![2] } else { Vec::new() }
+            );
+        }
     }
 
     #[test]

@@ -162,6 +162,8 @@ pub struct HostShader {
     /// Fixed compute SRV table entries accessed only with scalar byte loads.
     /// Each pair is (root parameter slot, dword offset of the view in the table).
     pub scalar_raw_srvs: Vec<(u8, u32)>,
+    /// User-data indices used only to select a raw compute SRV from the view heap.
+    pub direct_raw_indices: Vec<u32>,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -405,6 +407,7 @@ pub fn emit(
         mesh_wave32_compatible: l.mesh_lane_independent,
         record_stride: l.record_stride,
         scalar_raw_srvs: scalar_srvs::entries(native, p, res),
+        direct_raw_indices: scalar_srvs::direct_indices(native, p, res),
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -677,6 +680,7 @@ mod tests {
             mesh_wave32_compatible: false,
             record_stride: None,
             scalar_raw_srvs: Vec::new(),
+            direct_raw_indices: Vec::new(),
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -690,6 +694,7 @@ mod tests {
                 mesh_wave32_compatible: false,
                 record_stride: None,
                 scalar_raw_srvs: Vec::new(),
+                direct_raw_indices: Vec::new(),
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),
