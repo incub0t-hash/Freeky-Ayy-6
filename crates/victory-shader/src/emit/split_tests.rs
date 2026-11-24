@@ -393,6 +393,26 @@ fn standalone_readfirstlane_broadcasts_across_halves() {
     ));
 }
 
+#[test]
+fn guarded_constant_buffer_fill_declares_supported_wave_and_respects_bounds() {
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    let fill = |last_move| {
+        program(&[
+            0x7DA8_00A8, // v_cmpx_gt_u32 exec, 40, v0
+            0xBF88_0005, // s_cbranch_execz end
+            last_move,
+        ], 64)
+    };
+    let native = fill(0x7E04_0291); // v_mov_b32 v2, 17
+    let cs = emit_for(&native, target).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+    assert_eq!(wave_size(&emit_for(&native, super::Target::ANY).unwrap().dxil), None);
+    // A varying fill value has no proof that overlapping writes agree.
+    let varying = fill(0x7E04_0300); // v_mov_b32 v2, v0
+    assert_eq!(wave_size(&emit_for(&varying, target).unwrap().dxil), None);
+    program_case("bounded constant store", &native, |t| if t < 40 { 17 } else { 0 }, true);
+}
+
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]

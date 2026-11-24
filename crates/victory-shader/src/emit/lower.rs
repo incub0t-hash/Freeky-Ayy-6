@@ -358,6 +358,63 @@ fn waterfall_read(res: &Resources, inst: &Inst) -> bool {
         .is_some_and(|w| res.waterfall.reads.contains(&w.1))
 }
 
+/// A range-checked buffer fill: an EXEC comparison at entry skips straight
+/// to the exit. Only active threads perform the store, and no instruction
+/// after the store consumes scalars set by the threads that entered.
+fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
+    let [entry, fill, end] = p.blocks.as_slice() else { return false };
+    if entry.exit != (Exit::Branch { taken: 2, not_taken: 1 })
+        || fill.exit != Exit::Jump(2)
+        || end.exit != Exit::End
+        || !matches!(end.insts.as_slice(), [i] if i.name() == "s_endpgm")
+        || !matches!(entry.insts.last(), Some(i) if i.name() == "s_cbranch_execz")
+    {
+        return false;
+    }
+    let local = |i: &Inst| match &i.fields {
+        Fields::Valu(v) => v.dpp.is_none() && v.sdwa.is_none()
+            && matches!(i.name(), "v_mov_b32" | "v_add_nc_u32" | "v_lshl_add_u32"
+                | "v_lshlrev_b32" | "v_lshrrev_b32" | "v_cmpx_gt_u32")
+            && v.src.iter().all(|op| matches!(op, Operand::Vector { .. }
+                | Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
+        Fields::Sop { dst: Some(Operand::Scalar { code: 0..=105, .. }), src, .. } =>
+            matches!(i.name(), "s_mov_b32" | "s_mul_i32")
+                && src.iter().all(|op| matches!(op, Operand::Scalar { code: 0..=105, .. }
+                    | Operand::Const(128..=208) | Operand::Literal(_))),
+        Fields::Smem { .. } => i.name() == "s_load_dwordx4",
+        _ => false,
+    };
+    if !entry.insts[..entry.insts.len()-1].iter().all(local) {
+        return false;
+    }
+    let Some((store, before)) = fill.insts.split_last() else { return false };
+    if !before.iter().all(|i| local(i) && i.name() != "v_cmpx_gt_u32")
+        || !matches!(store.name(), "buffer_store_dword" | "buffer_store_format_d16_xyzw")
+    {
+        return false;
+    }
+    let Fields::Buffer { data: Some(Operand::Vector { reg, dwords }), lds: false, .. } = store.fields else {
+        return false;
+    };
+    let [descriptor] = res.descriptors.as_slice() else { return false };
+    let Source::Loaded { load, first: 0 } = descriptor.source else { return false };
+    if descriptor.site != (1, before.len()) || descriptor.role != Role::Resource
+        || res.scalar.len() != 1 || res.scalar[0].0 != load
+    {
+        return false;
+    }
+    // Even if two lanes address the same element, they write identical
+    // data. Each stored dword must come from an immediate move in the fill.
+    (0..dwords).all(|k| {
+        let dest = Reg::V(reg + k);
+        store.read(dest).is_some_and(|value| before.iter().any(|i| {
+            i.write(dest) == Some(value) && i.name() == "v_mov_b32"
+                && matches!(&i.fields, Fields::Valu(v) if matches!(v.src.as_slice(),
+                    [Operand::Const(128..=208) | Operand::Literal(_)]))
+        }))
+    })
+}
+
 /// Straight-line mesh exports with full EXEC. Each output is owned by one
 /// group thread. Lane reads rendezvous using a slot per thread, so they
 /// require complete virtual waves and all threads must reach them.
@@ -1223,6 +1280,14 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.x.native.stage == HwStage::Cs
+            && self.x.native.wave64 && !self.x.target.runs(64) && self.x.target.runs(32)
+            && self.s.threads == Some([64, 1, 1]) && self.s.lds_dwords == 0
+            && self.s.wave_size.is_none() && self.s.flags & flags::WAVE_OPS == 0
+            && bounded_constant_fill(p, self.x.res)
+        {
+            self.s.wave_size = Some(32);
+        }
         Ok(Lowered {
             mesh_lane_independent: self.mesh_lane_independent && self.s.flags & flags::WAVE_OPS == 0,
             cmp_samplers,
