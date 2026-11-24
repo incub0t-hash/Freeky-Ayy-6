@@ -176,6 +176,7 @@ fn root_cbv(list: &HostList, address: u64) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_access(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -414,6 +415,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_access(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -432,6 +434,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_access(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -663,6 +666,7 @@ impl State {
         if let Some((s, _, n)) = &backing {
             let len = u64::from(*n) * 4;
             s.refresh(list, address, len);
+            list.buffer_access(&s.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             s.gpu_writes(list, address, len);
         }
         let handle = host.gpu_handle(index);
@@ -894,6 +898,7 @@ impl State {
         let host = crate::descriptor::heap(heap_id as This).host()?;
         let key = (heap_id, window.as_ref().map(|w| w.identity()));
         if let Some(&slot) = self.raw_srv_views.get(&key) {
+            if let Some(window) = &window { window.read_access(list); }
             return Some((slot, host.gpu_handle(slot)));
         }
         let slot = host.dynamic(1)?;
@@ -1396,6 +1401,13 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        if list.indirect_write_conflict(&args.buffer)
+            || count_buffer.is_some_and(|buffer| list.indirect_write_conflict(buffer))
+        {
+            crate::indirect::done(list, &args.buffer, count_buffer);
+            why("indirect input also bound for unordered writes on this command");
+            return false;
+        }
         if !ran {
             crate::indirect::done(list, &args.buffer, count_buffer);
             why("pipeline exists but its resources could not be bound");
@@ -1487,7 +1499,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
+            list.buffer_access(&shadow.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             shadow.gpu_writes(list, address, len);
+        } else {
+            list.buffer_access(&shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
         }
     }
     match (view, u.kind) {

@@ -42,7 +42,7 @@ struct Indirect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{host, transition};
+    use crate::host::host;
 
     #[test]
     fn samples_compiled_scene_even_after_busy_loading_frames() {
@@ -72,23 +72,16 @@ mod tests {
                 count_ptr.add(4).cast::<u32>().write(1);
                 let records = [90_000u32, 1, 1, 90_001, 1, 1];
                 std::ptr::copy_nonoverlapping(records.as_ptr(), mapped.add(8).cast(), 6);
-                let mut barriers = vec![transition(
-                    &args,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )];
-                if !shared {
-                    barriers.push(transition(
-                        counter,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    ));
-                }
-                list.list.ResourceBarrier(&barriers);
+                list.buffer_access(&args, D3D12_RESOURCE_STATE_GENERIC_READ);
+                if !shared { list.buffer_access(counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); }
                 // Four records would overrun this 32-byte range.
                 query.indirect_before(&list, (&args, 8), Some((counter, 4)), (10, 12, 4));
                 assert!(query.indirect.is_none());
                 query.indirect_before(&list, (&args, 8), Some((counter, 4)), (10, 12, 2));
+                assert_eq!(list.buffer_state(&args), D3D12_RESOURCE_STATE_GENERIC_READ);
+                if !shared {
+                    assert_eq!(list.buffer_state(counter), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
                 assert_eq!(query.indirect.as_ref().unwrap().shared_resource, shared);
                 assert!(crate::indirect::bound(
                     &list,
@@ -322,23 +315,17 @@ impl Query {
         after: bool,
     ) {
         let Some(info) = &self.indirect else { return };
-        let state = if after {
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
-        } else {
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        };
-        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        let distinct = count.filter(|c| c.0 != args);
-        let transitions = |from, to| {
-            let mut barriers = vec![crate::host::transition(args, from, to)];
-            if let Some((counter, _)) = distinct {
-                barriers.push(crate::host::transition(counter, from, to));
-            }
-            // SAFETY: each unique buffer is transitioned once and restored after the copies.
-            unsafe { list.list.ResourceBarrier(&barriers) };
-        };
+        let buffers: Vec<_> = std::iter::once(args)
+            .chain(count.filter(|c| c.0 != args).map(|c| c.0))
+            .filter_map(|buffer| {
+                let before = list.buffer_state(buffer);
+                (before.0 & D3D12_RESOURCE_STATE_COPY_SOURCE.0 == 0).then_some((buffer, before))
+            })
+            .collect();
+        for (buffer, _) in &buffers {
+            list.buffer_access(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        }
         let start = (STATS_BYTES + usize::from(after) * SNAPSHOT_WORDS * 4) as u64;
-        transitions(state, source);
         // SAFETY: indirect_before checked both complete source ranges. All sampled
         // records and the optional count have disjoint destinations within this snapshot.
         unsafe {
@@ -361,7 +348,9 @@ impl Query {
                 );
             }
         }
-        transitions(source, state);
+        for (buffer, before) in buffers {
+            list.buffer_access(buffer, before);
+        }
     }
 
     pub(crate) fn end(self, list: &HostList) {

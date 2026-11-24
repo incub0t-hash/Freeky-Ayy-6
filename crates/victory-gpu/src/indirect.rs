@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=5, b0), UAV(u0), UAV(u1), UAV(u2)"
@@ -177,6 +177,11 @@ pub(crate) fn bound(
         (at - at % alignment, (at % alignment) as u32)
     });
     let constants = [kind, stride, records, first_byte as u32, count_byte];
+    list.buffer_access(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    let distinct = count.filter(|(counter, _)| *counter != buffer).map(|(counter, _)| counter);
+    if let Some(counter) = distinct {
+        list.buffer_access(counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -189,43 +194,21 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, count_base);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
-        if let Some((counter, _)) = count.filter(|(counter, _)| *counter != buffer) {
-            l.ResourceBarrier(&[transition(
-                counter,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            )]);
-        }
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    for input in std::iter::once(buffer).chain(distinct) {
+        list.buffer_access(input, D3D12_RESOURCE_STATE_GENERIC_READ);
+        list.indirect_buffer(input, true);
     }
     true
 }
 
-/// Restore the argument and count buffers to unordered access. A count in
-/// the argument buffer shares its state transition.
+/// Release each unique input after execution or a failed title binding.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )]);
-        if let Some(counter) = count.filter(|counter| *counter != buffer) {
-            list.list.ResourceBarrier(&[transition(
-                counter,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
-        }
-    };
+    for input in std::iter::once(buffer).chain(count.filter(|counter| *counter != buffer)) {
+        list.indirect_buffer(input, false);
+        list.buffer_access(input, D3D12_RESOURCE_STATE_COMMON);
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {

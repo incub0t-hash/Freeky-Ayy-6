@@ -24,11 +24,7 @@ fn read_clamped(list: &HostList, kind: u32, batches: &[&[[u32; 4]]]) -> Vec<[u32
     unsafe {
         mapped.cast::<u64>().write(header);
         std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), mapped.add(8), bytes);
-        list.list.ResourceBarrier(&[transition(
-            &args,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )]);
+        list.buffer_access(&args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         let mut offset = 8;
         for batch in batches {
             assert!(crate::indirect::bound(
@@ -252,16 +248,13 @@ fn scene_raw_window(direct: bool) {
             if pass == 0 {
                 s.refresh(&list, address, bytes.into());
                 s.gpu_writes(&list, address, bytes.into());
+                list.buffer_access(&s.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 list.list.SetComputeRootSignature(&writer_root);
                 list.list.SetPipelineState(&writer);
                 list.list
                     .SetComputeRootUnorderedAccessView(0, s.gpu(address));
                 list.list.Dispatch(1, 1, 1);
-                list.list.ResourceBarrier(&[transition(
-                    &s.buffer,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
+
             }
             let mut state = super::State::default();
             state.set_heaps(&[guest_heap]);
@@ -451,6 +444,108 @@ fn bounded_root_srv_stops_mesh_fetch_at_the_recorded_allocation_end() {
         }
     }
     shadow::unregister(owner, base);
+    crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(guest_heap, 16)(
+        guest_heap,
+    );
+}
+
+#[test]
+fn indirect_dispatch_reads_its_argument_buffer_as_a_private_raw_srv() {
+    use crate::{descriptor, shadow};
+    let host = host().expect("GPU required");
+    let dev = &host.device;
+    let reader = compile(
+        r#"
+        ByteAddressBuffer scene : register(t3);
+        RWByteAddressBuffer result : register(u0);
+        [RootSignature("DescriptorTable(SRV(t3)), UAV(u0)")][numthreads(1,1,1)]
+        void main(uint3 id : SV_DispatchThreadID) {
+            uint old; result.InterlockedAdd(0, 1, old);
+            result.Store(4+id.x*4, scene.Load(id.x*4));
+        }
+    "#,
+        s!("cs_5_1"),
+    );
+    let null = std::ptr::null();
+    let mut guest_heap = null;
+    let heap_desc = [0u32, 8, 1, 0, 0, 0, 0, 0];
+    assert_eq!(
+        descriptor::create_heap(
+            null,
+            heap_desc.as_ptr().cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut guest_heap
+        ),
+        crate::object::S_OK
+    );
+    let heap = descriptor::heap(guest_heap).host().unwrap();
+    let mut guest = [0u32; 32];
+    let base = guest.as_ptr() as u64;
+    guest[0..3].copy_from_slice(&[3, 1, 1]);
+    guest[4] = 1;
+    guest[8..11].copy_from_slice(&[0xa1b2c3d4, 0x10203040, 0xfeedcafe]);
+    shadow::register(base as usize, base, 128);
+    let args = shadow::find_named(base, 128).unwrap();
+    unsafe {
+        let root: ID3D12RootSignature = dev.CreateRootSignature(0, &reader).unwrap();
+        let pipe: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: shader(&reader),
+                ..Default::default()
+            })
+            .unwrap();
+        let signature = host_signature(2, 12).unwrap();
+        for shared_count in [true, false] {
+            let (out, mapped) = host.shared_buffer(16).unwrap();
+            std::ptr::write_bytes(mapped, 0, 16);
+            let (separate, count_data) = host.shared_buffer(16).unwrap();
+            count_data.cast::<u32>().write(1);
+            let (count, count_offset) = if shared_count {
+                (&args.buffer, 16)
+            } else {
+                (&separate, 0)
+            };
+            let list = host.new_list().unwrap();
+            let mut state = super::State::default();
+            state.set_heaps(&[guest_heap]);
+            args.refresh(&list, base, 128);
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            let bind = |state: &mut super::State| {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pipe);
+                assert!(state.root_srv_table(&list, Some(base + 32), 0, true));
+                list.list
+                    .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            };
+            bind(&mut state);
+            list.list.Dispatch(1, 1, 1);
+            assert!(crate::indirect::bound(
+                &list,
+                &args.buffer,
+                args.gpu(base),
+                (2, 12, 1),
+                Some((count, count.GetGPUVirtualAddress() + count_offset))
+            ));
+            bind(&mut state);
+            list.list
+                .ExecuteIndirect(&signature, 1, &args.buffer, 0, count, count_offset);
+            crate::indirect::done(&list, &args.buffer, Some(count));
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(
+                mapped.cast::<[u32; 4]>().read_volatile(),
+                [4, 0xa1b2c3d4, 0x10203040, 0xfeedcafe]
+            );
+            dev.GetDeviceRemovedReason().unwrap();
+            assert_eq!(
+                host.log_messages(),
+                None,
+                "D3D12 validation; shared_count={shared_count}"
+            );
+        }
+    }
+    shadow::unregister(base as usize, base);
     crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(guest_heap, 16)(
         guest_heap,
     );
@@ -735,27 +830,14 @@ fn indirect_framebuffer(location: Option<CountLocation>) {
         let dsv = host.dsv(&depth, None);
 
         // GPU-generated arguments.
-        list.list.ResourceBarrier(&[
-            transition(
-                &args,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &vb,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-            ),
-        ]);
+        list.buffer_access(&args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list.list.ResourceBarrier(&[transition(&vb, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)]);
 
         list.list.SetComputeRootSignature(&compute_root);
         list.list.SetPipelineState(&compute);
         if separate.is_some() {
-            list.list.ResourceBarrier(&[transition(
-                counter,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+            list.buffer_access(counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         list.list
             .SetComputeRootUnorderedAccessView(1, counter.GetGPUVirtualAddress());

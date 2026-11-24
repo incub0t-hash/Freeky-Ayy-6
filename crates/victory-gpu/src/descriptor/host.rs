@@ -589,7 +589,12 @@ impl ScalarWindow {
         true
     }
 
+    pub(crate) fn read_access(&self, list: &crate::host::HostList) {
+        list.buffer_access(&self.shadow.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+
     pub(crate) fn refresh(&self, list: &crate::host::HostList) {
+        self.read_access(list);
         crate::shadow::refresh_named(list, &self.shadow, self.address, self.len);
     }
 }

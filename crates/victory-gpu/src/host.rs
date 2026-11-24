@@ -153,6 +153,9 @@ fn create() -> windows::core::Result<Host> {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
                     d1.SetEnableGPUBasedValidation(true);
                 }
+                // Synthetic GPU tests exercise explicitly tracked resources and
+                // keep the debug layer's default GPU-side state validation.
+                #[cfg(not(test))]
                 if let Ok(d2) = l.cast::<ID3D12Debug2>() {
                     d2.SetGPUBasedValidationFlags(
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
@@ -319,6 +322,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Title buffer states during this list. Each list restores COMMON before
+    /// the next list in the same ExecuteCommandLists submission can use them.
+    buffers: Mutex<std::collections::HashMap<usize, BufferUse>>,
     /// The host texture most recently fully overwritten on this very list.
     /// A possible competing write or a guest-memory operation drops the proof.
     packed_owner: std::sync::atomic::AtomicUsize,
@@ -348,6 +354,13 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+struct BufferUse {
+    buffer: ID3D12Resource,
+    state: D3D12_RESOURCE_STATES,
+    indirect: bool,
+    write_conflict: bool,
+}
 
 type States = std::collections::HashMap<usize, TextureUse>;
 
@@ -600,6 +613,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffers: Mutex::default(),
                 packed_owner: 0.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -996,7 +1010,71 @@ impl HostList {
         times
     }
 
+    /// Public #1527 tracks the actual list state before using an indirect
+    /// resource. A full read state also covers SRVs and vertex/index data.
+    pub(crate) fn buffer_access(&self, resource: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        let mut states = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = states
+            .entry(resource.as_raw() as usize)
+            .or_insert_with(|| BufferUse {
+                buffer: resource.clone(),
+                state: D3D12_RESOURCE_STATE_COMMON,
+                indirect: false,
+                write_conflict: false,
+            });
+        if entry.indirect && wanted == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            entry.write_conflict = true;
+            return;
+        }
+        if entry.state != wanted {
+            unsafe {
+                self.list
+                    .ResourceBarrier(&[transition(resource, entry.state, wanted)])
+            };
+            entry.state = wanted;
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn buffer_state(&self, resource: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(resource.as_raw() as usize))
+            .map_or(D3D12_RESOURCE_STATE_COMMON, |b| b.state)
+    }
+
+    pub(crate) fn indirect_buffer(&self, resource: &ID3D12Resource, hold: bool) {
+        if let Some(entry) = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(resource.as_raw() as usize))
+        {
+            entry.indirect = hold;
+            entry.write_conflict = false;
+        }
+    }
+
+    pub(crate) fn indirect_write_conflict(&self, resource: &ID3D12Resource) -> bool {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(resource.as_raw() as usize))
+            .is_some_and(|entry| entry.write_conflict)
+    }
+
     pub(crate) fn close(&self) {
+        let states = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let barriers: Vec<_> = states.values()
+            .filter(|b| b.state != D3D12_RESOURCE_STATE_COMMON)
+            .map(|b| transition(&b.buffer, b.state, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        if !barriers.is_empty() {
+            // The list retains the buffer references until reset after the fence.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        drop(states);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1018,6 +1096,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.forget_packed_owner();
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
