@@ -1672,10 +1672,21 @@ void main() {
     /// writes back to title memory, and map null/invalid addresses safely to 0.
     #[test]
     fn bindless_slots_materialize_refresh_and_copy_back_on_gpu() {
+        bindless_streaming_probe(0, 16);
+    }
+
+    #[test]
+    #[ignore = "extended GPU streaming stress test"]
+    fn bindless_streaming_stress() {
+        bindless_streaming_probe(256, 4096);
+    }
+
+    fn bindless_streaming_probe(rounds: u32, slots: u32) {
         let Some(host) = host() else {
+            assert_eq!(rounds, 0, "GPU required for stress test");
             return;
         };
-        let (title_heap, base) = make_shader_heap(16);
+        let (title_heap, base) = make_shader_heap(slots);
         let slot_handle = |i: u64| base + i * 32;
 
         // Backing title memory (64 KiB aligned).
@@ -1905,6 +1916,110 @@ void main() {
             out2[4], 0,
             "overflowing u64::MAX garbage address safely reads zero"
         );
+
+        if rounds != 0 {
+            use windows::core::Interface;
+
+            // Thousands of descriptors alias a fixed resource set.
+            for i in 16..u64::from(slots) {
+                copy_simple(
+                    std::ptr::null(),
+                    1,
+                    slot_handle(i),
+                    slot_handle(0),
+                    0,
+                );
+            }
+
+            let allocation_counts = || {
+                let kept = host_heap.kept.lock().unwrap();
+
+                let occupied = kept.iter()
+                    .filter(|r| r.is_some())
+                    .count();
+
+                let unique = kept.iter()
+                    .filter_map(|r| r.as_ref())
+                    .map(|r| r.as_raw() as usize)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+
+                drop(kept);
+
+                let chunks = host_heap.bindless.lock()
+                    .unwrap().bounce_chunks.len();
+
+                (occupied, unique, chunks)
+            };
+
+            let mut baseline = None;
+
+            let started = std::time::Instant::now();
+
+            for i in 1..=rounds {
+                unsafe {
+                    (srv_addr as *mut u32)
+                        .write_volatile(i + 1000);
+
+                    (cbv_16b_addr as *mut [u32; 4])
+                        .write_volatile([i, i * 2, i * 3, i * 4]);
+                }
+
+                // Remap a texture after the previous GPU work completed.
+                if i % 16 == 0 {
+                    crate::watch::title_memory_remapped(
+                        placed_tex_addr as usize,
+                        64 << 10,
+                    );
+                }
+
+                record_probe(&list);
+                host.execute(&[&list]);
+                list.reset();
+
+                let result = unsafe {
+                    (uav_addr as *const [u32; 5])
+                        .read_volatile()
+                };
+
+                assert_eq!(
+                    result,
+                    [i + 1000, i * 10, 0x7856_3412, 0, 0],
+                    "Incorrect GPU result at iteration {i}"
+                );
+
+                let counts = allocation_counts();
+
+                if i == 1 {
+                    baseline = Some(counts);
+                }
+
+                assert_eq!(
+                    Some(counts),
+                    baseline,
+                    "Resource retention grew at iteration {i}"
+                );
+
+                if i % 32 == 0 || i == 1 {
+                    println!(
+                        "STREAMING {i}/{rounds}: \
+                         occupied={} unique={} bounce_chunks={} \
+                         elapsed={:.2}s",
+                        counts.0,
+                        counts.1,
+                        counts.2,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            }
+
+            crate::watch::title_memory_remapped(
+                placed_tex_addr as usize,
+                64 << 10,
+            );
+
+            println!("VERIFIED: sustained GPU streaming and writeback");
+        }
 
         assert_eq!(release(srv_res), 0);
         assert_eq!(release(uav_res), 0);
