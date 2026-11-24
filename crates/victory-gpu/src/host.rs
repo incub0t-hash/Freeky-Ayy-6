@@ -166,6 +166,14 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// Submissions started and finished so far ([`STARTED`], [`FINISHED`]): a
+/// heap map's pool slot given back while submission n may run is handed
+/// out again once n has finished (`descriptor::slot_map`), as [`retire`]
+/// drops objects.
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
