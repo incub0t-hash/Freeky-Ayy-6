@@ -396,6 +396,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_range(address, len, true)
+}
+
+/// A live, explicitly registered buffer that contains the whole range.
+/// This path never constructs a loose mapping from a guest pointer.
+pub(crate) fn find_named(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_range(address, len, false)
+}
+
+fn find_range(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -406,7 +416,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return if allow_loose {
+            loose(address, end)
+        } else {
+            None
+        };
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -433,6 +447,27 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
     entry.shadow.clone()
+}
+
+/// Refresh only the same registered generation that recording selected.
+/// Holding the registry lock prevents its backing from being released while
+/// copying. A later allocation at the same address has another Shadow.
+pub(crate) fn refresh_named(list: &HostList, shadow: &Arc<Shadow>, address: u64, len: u64) {
+    let shadow = shadow.clone();
+    list.defer_host(move || {
+        let map = buffers();
+        let live = map
+            .range((shadow.start, 0)..=(shadow.start, usize::MAX))
+            .any(|(_, entry)| {
+                entry
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(s, &shadow))
+            });
+        if live {
+            shadow.update(address as usize, len as usize);
+        }
+    });
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

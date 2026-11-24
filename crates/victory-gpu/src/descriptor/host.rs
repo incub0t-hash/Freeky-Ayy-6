@@ -503,6 +503,102 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+pub(crate) struct ScalarWindow {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    stride: u32,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+}
+
+impl ScalarWindow {
+    pub(crate) fn generation(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.shadow) as usize
+    }
+
+    pub(crate) fn bind(&self, list: &crate::host::HostList, heap: &HostHeap, index: u32) -> bool {
+        let Some(host) = host() else { return false };
+        self.refresh(list);
+        // SAFETY: a byte-exact view of the original live GPU allocation.
+        unsafe {
+            host.device.CreateShaderResourceView(
+                &self.shadow.buffer,
+                Some(&self.desc),
+                heap.cpu(index),
+            );
+        }
+        heap.keep(index, Some(self.shadow.buffer.clone()));
+        true
+    }
+
+    pub(crate) fn refresh(&self, list: &crate::host::HostList) {
+        crate::shadow::refresh_named(list, &self.shadow, self.address, u64::from(self.stride));
+    }
+}
+
+impl HostHeap {
+    pub(crate) fn null_scalar_buffer(&self, index: u32) {
+        null_buffer_view(self.cpu(index));
+        self.keep(index, None);
+    }
+}
+
+/// The scalar load uses DXIL RawBuffer semantics even when the source
+/// descriptor describes a structure. A fresh table carries that raw view.
+pub(crate) fn scalar_structured_view(view: &View) -> bool {
+    matches!(view, View::Placed(false, resource, words)
+        if resource[0] == 1 && words[0] == 0 && words[1] == 1
+            && words[6] == 1 && (4..=2048).contains(&words[7]))
+}
+
+/// Preserve upstream #206's checked raw-window conversion (05981dd),
+/// restricted to one statically identified scalar-read record in a named
+/// live buffer. Adjacent bytes and padding are never exposed.
+pub(crate) fn scalar_window(view: &View, stride: u32) -> Option<ScalarWindow> {
+    let View::Placed(false, resource, words) = view else {
+        return None;
+    };
+    let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+    if resource[0] != 1
+        || resource[12] & 4 != 0
+        || width != u64::from(stride)
+        || !(4..=2048).contains(&stride)
+        || !stride.is_multiple_of(4)
+        || words[0] != 0
+        || words[1] != 1
+        || words[4] != 0
+        || words[5] != 0
+        || words[6] != 1
+        || words[7] != stride
+        || words[8] != 0
+    {
+        return None;
+    }
+    let address = u64::from(words[10]) | u64::from(words[11]) << 32;
+    if address == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find_named(address, width)?;
+    let offset = shadow.offset(address);
+    if !offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+        return None;
+    }
+    let mut desc = srv_desc(words[..10].try_into().ok()?);
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+        FirstElement: offset / 4,
+        NumElements: stride / 4,
+        StructureByteStride: 0,
+        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+    };
+    Some(ScalarWindow {
+        shadow,
+        address,
+        stride,
+        desc,
+    })
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,

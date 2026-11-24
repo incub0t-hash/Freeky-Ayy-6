@@ -138,6 +138,175 @@ fn shader(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
 }
 
 #[test]
+fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() {
+    use super::{ResourceType, RootType, UsedResource};
+    use crate::descriptor::{self, View, host::scalar_window};
+    let host = host().expect("GPU required");
+    let mut words = vec![0u32; 512];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = 0x12340000 + i as u32;
+    }
+    let base = words.as_ptr() as u64;
+    let owner = base as usize;
+    let address = base + 16;
+    let bytes = 456;
+    let view = |address: u64, width: u32, elements: u32| {
+        let mut resource = [0; 14];
+        (resource[0], resource[4]) = (1, width);
+        let mut desc = [0; 16];
+        (desc[1], desc[2], desc[6], desc[7]) = (1, 5768, elements, bytes);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        View::Placed(false, resource, desc)
+    };
+    let src = view(address, bytes, 1);
+    assert!(scalar_window(&src, bytes).is_none());
+    crate::shadow::register(owner, base, (words.len() * 4) as u64);
+    let s = crate::shadow::find_named(address, bytes.into()).unwrap();
+    assert!(scalar_window(&src, bytes).is_some());
+    assert!(scalar_window(&view(address + 4, bytes, 1), bytes).is_none());
+    assert!(scalar_window(&view(address, bytes, 2), bytes).is_none());
+    assert!(scalar_window(&view(address, bytes - 4, 1), bytes).is_none());
+    assert!(scalar_window(&view(base + 2000, bytes, 1), bytes).is_none());
+    // A shader-visible heap with the same 8-dword table offset the culler uses.
+    // Include the extended guest description's optional placement fields.
+    let extended_desc = [0u32, 8, 1, 0, 0, 0, 0, 0];
+    let null = std::ptr::null();
+    let mut guest_heap = null;
+    assert_eq!(
+        descriptor::create_heap(
+            null,
+            extended_desc.as_ptr().cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut guest_heap
+        ),
+        crate::object::S_OK
+    );
+    let guest = descriptor::heap(guest_heap);
+    let View::Placed(false, resource, desc) = &src else {
+        unreachable!()
+    };
+    descriptor::create_placed_srv(null, resource, desc, guest.start + 32);
+    let heap = guest.host().unwrap();
+    let u = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 77,
+        stride: bytes,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+
+    let producer = compile(
+        r#"
+        RWByteAddressBuffer target : register(u0);
+        [RootSignature("UAV(u0)")][numthreads(1,1,1)]
+        void main() { target.Store(0,0x789abcde); }
+    "#,
+        s!("cs_5_1"),
+    );
+    let consumer = compile(
+        r#"
+        ByteAddressBuffer scene : register(t0);
+        RWByteAddressBuffer result : register(u0);
+        [RootSignature("DescriptorTable(SRV(t0)), UAV(u0)")][numthreads(1,1,1)]
+        void main() { [loop] for (uint i=0;i<115;i++) result.Store(i*4,scene.Load(i*4)); }
+    "#,
+        s!("cs_5_1"),
+    );
+    unsafe {
+        let dev = &host.device;
+        let pipeline = |code: &[u8]| {
+            let root: ID3D12RootSignature = dev.CreateRootSignature(0, code).unwrap();
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: shader(code),
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let (writer_root, writer) = pipeline(&producer);
+        let (read_root, read) = pipeline(&consumer);
+        let (out, mapped) = host.shared_buffer(115 * 4).unwrap();
+        for pass in 0..2 {
+            let list = host.new_list().unwrap();
+            if pass == 0 {
+                s.refresh(&list, address, bytes.into());
+                s.gpu_writes(&list, address, bytes.into());
+                list.list.SetComputeRootSignature(&writer_root);
+                list.list.SetPipelineState(&writer);
+                list.list
+                    .SetComputeRootUnorderedAccessView(0, s.gpu(address));
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[transition(
+                    &s.buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            let mut state = super::State::default();
+            state.set_heaps(&[guest_heap]);
+            state.set_table(true, 0, guest.start);
+            assert!(state.tables(&list, &[u], true, &[]).is_empty());
+            let made = state.tables(&list, &[u], true, &[(0, 8)]);
+            assert_eq!(made.len(), 1);
+            assert_eq!(made[0].0, 0);
+            assert_eq!(state.tables(&list, &[u], true, &[(0, 8)]), made);
+            let slot = made[0].1 / 32 + 1;
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&read_root);
+            list.list.SetPipelineState(&read);
+            let mut handle = heap.heap.GetGPUDescriptorHandleForHeapStart();
+            handle.ptr += u64::from(slot)
+                * u64::from(
+                    dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                );
+            list.list.SetComputeRootDescriptorTable(0, handle);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+            list.close();
+            if pass == 1 {
+                for i in 4..118 {
+                    words[i] = 0xd00d0000 + i as u32;
+                }
+            }
+            host.execute(&[&list]);
+            let got = std::slice::from_raw_parts(mapped.cast::<u32>(), 115);
+            for i in 0..114 {
+                assert_eq!(
+                    got[i],
+                    if pass == 0 && i == 0 {
+                        0x789abcde
+                    } else if pass == 0 {
+                        0x12340004 + i as u32
+                    } else {
+                        0xd00d0004 + i as u32
+                    },
+                    "pass {pass}, dword {i}"
+                );
+            }
+            assert_eq!(got[114], 0, "the next record is outside this SRV");
+            assert_eq!(host.log_messages(), None, "D3D12 validation");
+        }
+    }
+    crate::shadow::unregister(owner, base);
+    assert!(scalar_window(&src, bytes).is_none());
+    crate::shadow::register(owner, base, 64);
+    assert!(scalar_window(&src, bytes).is_none());
+    crate::shadow::unregister(owner, base);
+    crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(guest_heap, 16)(
+        guest_heap,
+    );
+    eprintln!(
+        "Read 114 in-range dwords and one out-of-range dword after both GPU and CPU updates through the production descriptor table"
+    );
+}
+
+#[test]
 fn gpu_generated_draws_reach_depth_tested_framebuffer() {
     indirect_framebuffer(None);
 }
