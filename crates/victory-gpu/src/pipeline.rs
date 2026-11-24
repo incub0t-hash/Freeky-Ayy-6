@@ -98,6 +98,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the shader indexes `ResourceDescriptorHeap[]` directly.
+    pub(crate) resource_heap: bool,
 }
 
 #[cfg(windows)]
@@ -131,11 +133,20 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    use victory_shader::{Container, FourCC, HwStage, RootType};
+    let target = crate::host::host()
+        .map_or(victory_shader::emit::Target::ANY, |h| h.target());
     let host = crate::shader_cache::host_shader(container, target)?;
+    let dxil_heap = Container::parse(&host.dxil).is_ok_and(|c| {
+        c.part(FourCC::SFI0)
+            .and_then(|p| p.data.get(..8))
+            .is_some_and(|b| {
+                let flags = u64::from_le_bytes(b.try_into().unwrap_or_default());
+                flags & (1 << 32) != 0
+            })
+    });
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let (used, native_heap) = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -145,11 +156,19 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
             })
-            .map(|p| p.used)
+            .map(|p| {
+                let rh = p.layout.iter().any(|rp| rp.root == RootType::ResourceHeap)
+                    || p.used.iter().any(|u| u.root == RootType::ResourceHeap);
+                (p.used, rh)
+            })
             .unwrap_or_default(),
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
-    Ok(Translated { host, used })
+    Ok(Translated {
+        host,
+        used,
+        resource_heap: dxil_heap || native_heap,
+    })
 }
 
 #[repr(C)]

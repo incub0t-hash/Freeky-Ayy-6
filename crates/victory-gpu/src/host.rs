@@ -387,6 +387,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Materializes and refreshes bindless buffer/CBV/placed slots in a
+    /// shader-visible heap: once per submission per heap until a `Copy` or
+    /// `Run` intervenes.
+    Bindless(std::sync::Arc<crate::descriptor::host::HostHeap>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -404,6 +408,12 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Bindless view heaps queued for submission-time refresh since the last
+    /// title copy.
+    bindless: std::collections::HashSet<usize>,
+    /// Incremented whenever a deferred step may write title memory (`Copy` or
+    /// `Run`), invalidating per-list bindless preparation caches.
+    copy_epoch: u64,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -631,6 +641,14 @@ impl Host {
                 {
                     back.push((shadow.clone(), *address, *len));
                 }
+            }
+        }
+        for (shadow, address, len) in batch.bindless_writes.drain(..) {
+            if !back
+                .iter()
+                .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len))
+            {
+                back.push((shadow, address, len));
             }
         }
         for (shadow, address, len) in &back {
@@ -1060,6 +1078,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.bindless.clear();
+        deferred.copy_epoch += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1187,8 +1207,26 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.bindless.clear();
+        deferred.copy_epoch += 1;
+    }
+
+    /// Epoch of title-memory-writing steps recorded into this list so far.
+    pub(crate) fn title_write_epoch(&self) -> u64 {
+        self.deferred().copy_epoch
+    }
+
+    /// Queues submission-time materialization and refresh of bindless slots in
+    /// `heap` (once per list until a title copy intervenes).
+    pub(crate) fn defer_bindless(&self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>) {
+        let mut deferred = self.deferred();
+        let key = std::sync::Arc::as_ptr(heap) as usize;
+        if deferred.bindless.insert(key) {
+            deferred.copies.push(Step::Bindless(heap.clone()));
+        }
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1263,6 +1301,37 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::Bindless(heap) => {
+                    if batch.bindless_due(heap) {
+                        let mut uavs = Vec::new();
+                        let kept = heap.prepare_bindless_submit(
+                            |shadow, address, len| {
+                                #[cfg(feature = "diagnostics")]
+                                {
+                                    add(C::Refreshes, 1);
+                                    add(C::RefreshBytes, len as u64);
+                                }
+                                batch.add(shadow, address, len);
+                            },
+                            |shadow, address, len| {
+                                uavs.push((shadow.clone(), address, len));
+                            },
+                        );
+                        batch.bindless_kept.extend(kept);
+                        if !uavs.is_empty() {
+                            batch.flush();
+                            for (shadow, address, len) in uavs {
+                                shadow.writing(address, len);
+                                if !batch.bindless_writes.iter().any(|(s, a, l)| {
+                                    std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
+                                }) {
+                                    batch.bindless_writes.push((shadow, address, len));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -1283,6 +1352,12 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Bindless heaps (by address) prepared since the last title write.
+    bindless_heaps: std::collections::HashSet<usize>,
+    /// Bindless UAV buffer ranges written during this submission, for copy-back.
+    bindless_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Host resources viewed by bindless slots, held until GPU work completes.
+    bindless_kept: Vec<ID3D12Resource>,
 }
 
 impl Batch {
@@ -1304,11 +1379,19 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// Whether `heap` is still to be prepared for bindless access in this
+    /// submission (and notes it prepared).
+    fn bindless_due<T>(&mut self, heap: &std::sync::Arc<T>) -> bool {
+        self.bindless_heaps
+            .insert(std::sync::Arc::as_ptr(heap) as *const () as usize)
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// first, and textures and bindless heaps are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.bindless_heaps.clear();
     }
 
     fn flush(&mut self) {

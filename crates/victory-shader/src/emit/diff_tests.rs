@@ -1491,12 +1491,11 @@ fn translated_pixel_raster_oracle() {
                     native.vgprs,
                 ).unwrap();
 
-                let res = crate::resource::track(
-                    &ir, &native.layout, native.stage
-                ).unwrap();
-
-                let io = crate::io::raise(&ir, &native).unwrap();
                 let st = crate::structure::structure(&ir).unwrap();
+                let res = crate::resource::track(
+                    &ir, &native.layout, native.stage, Some(&st),
+                ).unwrap();
+                let io = crate::io::raise(&ir, &native).unwrap();
 
                 let mut ps = super::emit(
                     &container, &native, &ir,
@@ -1730,12 +1729,11 @@ fn translated_mesh_raster_oracle() {
             native.vgprs,
         ).expect("Mesh instruction decoding");
 
-        let res = crate::resource::track(
-            &ir, &native.layout, native.stage,
-        ).unwrap();
-
-        let io = crate::io::raise(&ir, &native).unwrap();
         let st = crate::structure::structure(&ir).unwrap();
+        let res = crate::resource::track(
+            &ir, &native.layout, native.stage, Some(&st),
+        ).unwrap();
+        let io = crate::io::raise(&ir, &native).unwrap();
 
         let mut ms = super::emit(
             &container, &native, &ir,
