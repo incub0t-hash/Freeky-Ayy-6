@@ -656,6 +656,7 @@ fn two_wave_group_orders_shared_reduction_and_broadcast() {
         for file in std::env::split_paths(&files) {
             let mut cs = super::translate_for(&std::fs::read(file).unwrap(), host.target()).unwrap();
             assert_eq!(wave_size(&cs.dxil), Some(32));
+            assert_eq!(cs.direct_scalar_indices, [6]);
             v.validate(&mut cs.dxil).unwrap();
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             // Two meshlet records select the same degenerate vertex at zero.
@@ -670,31 +671,50 @@ fn two_wave_group_orders_shared_reduction_and_broadcast() {
                 View::Buffer { data, stride: super::host::Stride::Raw }
             }
             for (flags, depth, count) in [(0, 0., 2), (2, 0., 0), (4, 0., 2), (4, 1., 0)] {
-                let mut records = zero;
-                records[16] = (flags << 24) | 6; // vertex/meshlet SRV in heap slot 6
-                let texels = [[depth; 4]; 4];
-                let views = [
-                    raw(&frame),
-                    raw(&table),
-                    View::Texture(2, 2, &texels),
-                    View::HalfUav(8),
-                    View::RawUav(8),
-                    View::Cbv(&records),
-                    raw(&zero),
-                ];
-                let mut words = vec![0; cs.user_data_dwords() as usize];
-                for param in &cs.user_data {
-                    if param.root == RootType::Constants {
-                        words[param.index as usize] = [0, 5, 6, 6][param.dword as usize];
+                for as_raw in [false, true] {
+                    let mut records = zero;
+                    records[16] = (flags << 24) | 6; // vertex/meshlet SRV in heap slot 6
+                    let texels = [[depth; 4]; 4];
+                    let views = [
+                        raw(&frame),
+                        raw(&table),
+                        View::Texture(2, 2, &texels),
+                        View::HalfUav(8),
+                        View::RawUav(8),
+                        if as_raw {
+                            raw(&records)
+                        } else {
+                            View::Cbv(&records)
+                        },
+                        raw(&zero),
+                    ];
+                    let mut words = vec![0; cs.user_data_dwords() as usize];
+                    for param in &cs.user_data {
+                        if param.root == RootType::Constants {
+                            words[param.index as usize] = [0, 5, 6, 6][param.dword as usize];
+                            if as_raw && cs.direct_scalar_indices.contains(&param.index) {
+                                words[param.index as usize] |= super::SCALAR_RAW_INDEX;
+                            }
+                        }
                     }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(words))],
+                                views: &views,
+                                samplers: &[],
+                                groups: [2, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        out[1],
+                        [count, 0, 0, 0, 0, 0, 0, 0],
+                        "flags {flags}, HZB depth {depth}, raw {as_raw}"
+                    );
                 }
-                let out = host.dispatch(&root, &pso, &Dispatch {
-                    roots: vec![(0, Root::Constants(words))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [2, 1, 1],
-                }).unwrap();
-                assert_eq!(out[1], [count, 0, 0, 0, 0, 0, 0, 0], "flags {flags}, HZB depth {depth}");
             }
         }
     }

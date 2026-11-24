@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH6";
+const MAGIC: &[u8; 4] = b"VSH7";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -227,9 +227,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, offset);
     }
-    word(&mut out, s.direct_raw_indices.len() as u32);
-    for &index in &s.direct_raw_indices {
-        word(&mut out, index);
+    for indices in [&s.direct_raw_indices, &s.direct_scalar_indices] {
+        word(&mut out, indices.len() as u32);
+        for &index in indices {
+            word(&mut out, index);
+        }
     }
     // The dispatch precondition travels with its DXIL and root mapping.
     // A torn or damaged entry must never lose just the precondition.
@@ -327,13 +329,33 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         }
         scalar_raw_srvs.push(entry);
     }
-    let n = r.word()? as usize;
-    let mut direct_raw_indices = Vec::with_capacity(n.min(32));
-    for _ in 0..n {
-        let index = r.word()?;
-        if stage != HwStage::Cs || direct_raw_indices.last().is_some_and(|v| *v >= index)
-            || !user_data.iter().any(|u| u.root == RootType::Constants && u.index == index) { return None; }
-        direct_raw_indices.push(index);
+    let mut read_indices = || -> Option<Vec<u32>> {
+        let n = r.word()? as usize;
+        if n > user_data.len() {
+            return None;
+        }
+        let mut indices = Vec::with_capacity(n);
+        for _ in 0..n {
+            let index = r.word()?;
+            if stage != HwStage::Cs
+                || indices.last().is_some_and(|v| *v >= index)
+                || !user_data
+                    .iter()
+                    .any(|u| u.root == RootType::Constants && u.index == index)
+            {
+                return None;
+            }
+            indices.push(index);
+        }
+        Some(indices)
+    };
+    let direct_raw_indices = read_indices()?;
+    let direct_scalar_indices = read_indices()?;
+    if direct_scalar_indices
+        .iter()
+        .any(|i| direct_raw_indices.contains(i))
+    {
+        return None;
     }
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -341,6 +363,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         record_stride,
         scalar_raw_srvs,
         direct_raw_indices,
+        direct_scalar_indices,
         dxil,
         user_data,
         samplers,
@@ -362,6 +385,7 @@ mod tests {
             record_stride: None,
             scalar_raw_srvs: Vec::new(),
             direct_raw_indices: Vec::new(),
+            direct_scalar_indices: Vec::new(),
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -463,6 +487,11 @@ mod tests {
         guarded.user_data[0].root = RootType::Constants;
         guarded.direct_raw_indices = vec![guarded.user_data[0].index];
         guarded.record_stride = Some(guarded.user_data[0]);
+        let mut scalar = guarded.clone();
+        scalar.direct_scalar_indices = std::mem::take(&mut scalar.direct_raw_indices);
+        assert_eq!(decode(&encode(&scalar)), Some(scalar.clone()));
+        scalar.direct_raw_indices = scalar.direct_scalar_indices.clone();
+        assert!(decode(&encode(&scalar)).is_none());
         let encoded = encode(&guarded);
         assert_eq!(decode(&encoded), Some(guarded.clone()));
         let mut damaged = encoded;

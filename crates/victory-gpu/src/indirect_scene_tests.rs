@@ -198,6 +198,13 @@ fn scene_raw_window(direct: bool) {
     direct_desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
     let direct_handle = guest.start + 17 * 32;
     descriptor::create_placed_srv(null, resource, &direct_desc, direct_handle);
+    let cbv_address = [base as u32, (base >> 32) as u32, 256, 0];
+    descriptor::create_cbv(null, &cbv_address, guest.start + 12 * 32);
+    let small_cbv = [address as u32, (address >> 32) as u32, 32, 0];
+    descriptor::create_cbv(null, &small_cbv, guest.start + 13 * 32);
+    let mut small_raw = direct_desc;
+    small_raw[6] = 8;
+    descriptor::create_placed_srv(null, resource, &small_raw, guest.start + 14 * 32);
     let heap = guest.host().unwrap();
     let u = UsedResource {
         kind: ResourceType::Srv,
@@ -261,8 +268,18 @@ fn scene_raw_window(direct: bool) {
             state.set_table(true, 0, guest.start);
             let slot = if direct {
                 let slot = state.direct_raw_view(&list, Some(17)).unwrap();
+                let tag = victory_shader::emit::SCALAR_RAW_INDEX;
+                assert_eq!(state.direct_scalar_view(&list, Some(17)), Some(slot | tag));
+                let cbv = state.direct_scalar_view(&list, Some(12)).unwrap();
+                assert_eq!(cbv & tag, 0);
+                assert_eq!(state.direct_scalar_view(&list, Some(12)), Some(cbv));
+                let small = state.direct_raw_view(&list, Some(14)).unwrap();
+                assert_eq!(state.direct_scalar_view(&list, Some(13)), Some(small | tag));
+                assert_ne!(small, slot);
+                assert_ne!(state.direct_scalar_view(&list, Some(1)).unwrap() & tag, 0);
                 assert_eq!(state.direct_raw_view(&list, Some(17)), Some(slot));
                 let empty = state.direct_raw_view(&list, Some(32)).unwrap();
+                assert_eq!(state.direct_scalar_view(&list, None), Some(empty | tag));
                 assert_eq!(state.direct_raw_view(&list, None), Some(empty));
                 assert_ne!(slot, empty);
                 // Recycle the selected guest slot before submission. The
