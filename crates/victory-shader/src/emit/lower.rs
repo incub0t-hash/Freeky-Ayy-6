@@ -248,6 +248,8 @@ struct Lower<'a> {
     console_cf: bool,
     /// A single virtual wave orders disjoint physical halves' buffer accesses.
     order_buffer_wave: bool,
+    /// All group-shared memory accesses have group-uniform checkpoints.
+    group_cull: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// Why a wave64 program that needs its whole wave cannot take the
@@ -804,6 +806,9 @@ impl<'a> Lower<'a> {
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
         let mut order_buffer_wave = false;
+        let group_cull = !x.console_cf && super::group_cull::candidate(x.native, p, x.target)
+            && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
+            && super::group_cull::prove(p, x.st, x.res, x.io);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -827,6 +832,7 @@ impl<'a> Lower<'a> {
             // A standalone readfirstlane must also cross halves. A host
             // wave's first active lane can differ even with full EXEC.
             let split_first_lane = x.native.wave64
+                && !group_cull
                 && !x.target.runs(64)
                 && insts().any(|i| i.name() == "v_readfirstlane_b32" && !waterfall_read(x.res, i));
             // A 64-thread culling kernel branches on whether VCC is set in
@@ -958,7 +964,7 @@ impl<'a> Lower<'a> {
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
             }
-            if split {
+            if split || group_cull && !console_lanes {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1059,6 +1065,7 @@ impl<'a> Lower<'a> {
             split,
             console_cf: x.console_cf,
             order_buffer_wave: x.console_cf && order_buffer_wave,
+            group_cull,
             wants_console_flow,
             no_console_flow,
             console_flat: None,
@@ -1493,6 +1500,7 @@ impl<'a> Lower<'a> {
             ));
         }
         let p = self.x.p;
+        let checkpoints = self.group_cull.then(|| super::group_cull::checkpoints(p));
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -1561,6 +1569,9 @@ impl<'a> Lower<'a> {
                         self.s.t.void, 168, &[vertices, primitives]);
                     self.mesh_counts = Some((vertices, primitives));
                 }
+                if checkpoints.as_ref().is_some_and(|points| points.contains(&(b, i))) {
+                    self.lds_checkpoint();
+                }
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -1572,10 +1583,16 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            if checkpoints.as_ref().is_some_and(|points| points.contains(&(b, p.blocks[b].insts.len()))) {
+                self.lds_checkpoint();
+            }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.group_cull && self.s.flags & flags::WAVE_OPS != 0 {
+            return Err(unsupported(0, "a wave operation remaining in a group-shared compute proof"));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1619,6 +1636,11 @@ impl<'a> Lower<'a> {
 
     fn exported_out(&self, b: usize) -> bool {
         self.exported[b] || self.has_done_export(b)
+    }
+
+    fn lds_checkpoint(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
     }
 
     fn has_done_export(&self, b: usize) -> bool {
@@ -3017,6 +3039,9 @@ impl<'a> Lower<'a> {
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        // Masked-off lanes may hold arbitrary addresses. During a certified
+        // read-only LDS phase they can safely read word zero and discard it.
+        let guarded_read = guard.filter(|_| self.group_cull && name.starts_with("ds_read"));
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
         let dword = |l: &mut Self, bytes: u32| -> V {
@@ -3025,6 +3050,12 @@ impl<'a> Lower<'a> {
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let index = if let Some(active) = guarded_read {
+                let zero = l.s.m.i32(0);
+                l.s.m.select(c, active, index, zero)
+            } else {
+                index
+            };
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };
@@ -5177,7 +5208,7 @@ impl<'a> Lower<'a> {
                 let r = self.mesh_read_lane(a, first);
                 int(self, r)
             }
-            "v_readfirstlane_b32" if self.mesh_allocation.is_some() => {
+            "v_readfirstlane_b32" if self.mesh_allocation.is_some() || self.group_cull => {
                 let a = s(self, 0)?;
                 int(self, a)
             }

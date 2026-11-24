@@ -80,6 +80,7 @@
 mod bitcode;
 mod scalar_srvs;
 mod gather_lod;
+mod group_cull;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -298,6 +299,28 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
 
 /// Emits a program whose earlier stages already ran, for `target`.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+) -> Result<HostShader, ShaderError> {
+    if group_cull::candidate(native, p, target)
+        && let Some(code) = group_cull::predicated_code(native, p)
+        && let Ok(predicated) = ir::build(&code, native.wave64, native.vgprs)
+        && let Ok(st) = structure::structure(&predicated)
+        && let Ok(res) = resource::track(&predicated, &native.layout, native.stage, Some(&st))
+        && let Ok(io) = io::raise(&predicated, native)
+        && let Ok(shader) = emit_prepared(c, native, &predicated, &st, &io, &res, target)
+    {
+        return Ok(shader);
+    }
+    emit_prepared(c, native, p, st, io, res, target)
+}
+
+fn emit_prepared(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
