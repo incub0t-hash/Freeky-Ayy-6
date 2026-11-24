@@ -1,4 +1,4 @@
-//! A group-uniform allocation in a position-only mesh program. The console
+//! A group-uniform allocation in a mesh program with per-vertex outputs. The console
 //! asks for its outputs from thread zero. DXIL needs the same counts in one
 //! converged call before any thread can write an output.
 
@@ -8,7 +8,7 @@ use super::lower::Parts;
 use crate::gfx10::{Fields, Operand};
 use crate::io::Input;
 use crate::ir::{EXEC, Exit, Inst, M0, Reg, Value};
-use crate::native::{MeshIo, ResourceType};
+use crate::native::{MeshIo, ResourceType, Usage};
 use crate::resource::Site;
 use crate::structure::{Atom, Bool, LaneExit};
 
@@ -244,6 +244,21 @@ impl Proof<'_> {
     }
 }
 
+// D3D12 allows 32 signature rows, with one interpolation mode per row,
+// and 32 KiB of output storage per group. Host attributes are 32 bits
+// even where the source packs two half-precision values into a register.
+fn vertex_signature(outputs: &[super::container::SigElement], vertices: u32) -> bool {
+    outputs
+        .iter()
+        .all(|e| matches!(e.kind, 0 | 3) && e.row.is_some_and(|r| r < 32))
+        && outputs.iter().map(|e| u64::from(e.cols)).sum::<u64>() * 4 * u64::from(vertices) <= 32768
+        && outputs.iter().all(|e| {
+            outputs
+                .iter()
+                .all(|f| e.row != f.row || e.interp == f.interp)
+        })
+}
+
 pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
     if !x.native.wave64
         || ms.threads != 128
@@ -251,7 +266,12 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
         || ms.max_primitives != 128
         || ms.lds_bytes != 0
         || ms.topology != 2
-        || !ms.outputs.is_empty()
+        || !x.prims.is_empty()
+        || !vertex_signature(&x.outputs, ms.max_vertices)
+        || ms
+            .outputs
+            .iter()
+            .any(|o| o.usage != Usage::Generic || o.param >= 32)
         || x.native.used.iter().any(|r| r.kind == ResourceType::Uav)
     {
         return None;
@@ -271,6 +291,7 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
     let mut alloc = None;
     let mut visited = HashSet::new();
     let mut group_edges = HashSet::new();
+    let mut scalar_values = proof.uniform.clone();
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
         if !block.preds.iter().all(|q| visited.contains(q)) {
@@ -287,17 +308,52 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
             }
             if same_edge && phi.args.iter().all(|v| proof.uniform.contains(v)) {
                 proof.uniform.insert(phi.value);
+                scalar_values.insert(phi.value);
             }
         }
         for (k, i) in block.insts.iter().enumerate() {
             let name = i.name();
             let full = together && x.st.execs[b][k] == Some(Bool::TRUE);
+            let scalar_expression = match &i.fields {
+                Fields::Sop { .. } => {
+                    matches!(
+                        name,
+                        "s_mov_b32"
+                            | "s_movk_i32"
+                            | "s_add_i32"
+                            | "s_add_u32"
+                            | "s_mul_i32"
+                            | "s_and_b32"
+                            | "s_or_b32"
+                            | "s_bfe_u32"
+                            | "s_lshl_b32"
+                            | "s_lshr_b32"
+                            | "s_cselect_b32"
+                    ) || name.starts_with("s_cmp_")
+                }
+                Fields::Smem { .. } => {
+                    name.starts_with("s_load_") || name.starts_with("s_buffer_load_")
+                }
+                _ => false,
+            };
             let uniform = match &i.fields {
                 Fields::Exp {
-                    target: 12 | 20,
+                    target: 12 | 20 | 32..=63,
                     compr: false,
                     ..
                 } => false,
+                // Only scratch address seed registers. This proof rejects
+                // every use of scratch or flat memory.
+                Fields::Sop { imm: Some(imm), .. }
+                    if name == "s_setreg_imm32_b32" && matches!(imm & 63, 20 | 21) =>
+                {
+                    false
+                }
+                Fields::Image {
+                    tfe: false,
+                    lwe: false,
+                    ..
+                } if name == "image_load" => false,
                 Fields::Sopp { imm } if name == "s_sendmsg" => {
                     if *imm != 9 || alloc.replace((b, k)).is_some() {
                         return None;
@@ -319,19 +375,7 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
                 }
                 Fields::Sop { .. } if !name.contains("getreg") && !name.contains("setreg") => {
                     together
-                        && (matches!(
-                            name,
-                            "s_mov_b32"
-                                | "s_movk_i32"
-                                | "s_add_i32"
-                                | "s_add_u32"
-                                | "s_and_b32"
-                                | "s_or_b32"
-                                | "s_bfe_u32"
-                                | "s_lshl_b32"
-                                | "s_lshr_b32"
-                                | "s_cselect_b32"
-                        ) || name.starts_with("s_cmp_"))
+                        && scalar_expression
                         && i.reads.iter().all(|(_, v)| proof.uniform.contains(v))
                 }
                 Fields::Smem { .. }
@@ -356,10 +400,34 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
                 }
                 Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => match name {
                     "v_readfirstlane_b32" => {
-                        if !full || !v.src.first().is_some_and(|&op| proof.group_operand(i, op)) {
+                        let group_value =
+                            full && v.src.first().is_some_and(|&op| proof.group_operand(i, op));
+                        // A scalar converted in this block is broadcast to
+                        // every lane in this EXEC. Unchanged EXEC and an
+                        // unguarded writer ensure its first lane agrees with
+                        // every lane that consumes this scalar.
+                        let previous = proof.argument(i, 0).and_then(|v| proof.defs.get(&v));
+                        let local = previous.is_some_and(|def| {
+                            let Some(j) =
+                                block.insts[..k].iter().position(|w| std::ptr::eq(w, *def))
+                            else {
+                                return false;
+                            };
+                            def.name() == "v_cvt_u32_f32"
+                                && matches!(sources(def), [Operand::Scalar { code: 0..=105, .. }])
+                                && proof
+                                    .argument(def, 0)
+                                    .is_some_and(|v| scalar_values.contains(&v))
+                                && x.st.guards[b][j].is_none()
+                                && x.st.guards[b][k].is_none()
+                                && [Reg::S(EXEC), Reg::S(EXEC + 1)]
+                                    .iter()
+                                    .all(|&r| i.read(r) == def.read(r))
+                        });
+                        if !group_value && !local {
                             return None;
                         }
-                        true
+                        group_value
                     }
                     "v_cndmask_b32" => {
                         full && v.src.len() == 3
@@ -390,6 +458,8 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
             {
                 return None;
             }
+            let local_scalar =
+                scalar_expression && i.reads.iter().all(|(_, v)| scalar_values.contains(v));
             for &(reg, v) in &i.writes {
                 proof.defs.insert(v, i);
                 if full && x.st.reach[b] == Bool::TRUE {
@@ -401,6 +471,13 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
                     && !x.st.highs.contains_key(&v)
                 {
                     proof.uniform.insert(v);
+                }
+                if (local_scalar || proof.uniform.contains(&v))
+                    && matches!(reg, Reg::S(0..=105) | Reg::Scc)
+                    && !x.st.masks.contains_key(&v)
+                    && !x.st.highs.contains_key(&v)
+                {
+                    scalar_values.insert(v);
                 }
             }
         }
@@ -415,4 +492,37 @@ pub(super) fn prove<'a>(x: &'a Parts<'a>, ms: &MeshIo) -> Option<Allocation> {
         }
     }
     proof.allocation(alloc?, ms.threads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vertex_signature;
+    use crate::emit::container::SigElement;
+
+    #[test]
+    fn expanded_attributes_fit_host_output_storage_and_packing() {
+        let row = |n| SigElement {
+            name: "TEXCOORD".into(),
+            index: n,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(n),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: true,
+        };
+        let mut outputs: Vec<_> = (0..16).map(row).collect();
+        assert!(vertex_signature(&outputs, 128));
+        outputs.push(row(16));
+        assert!(!vertex_signature(&outputs, 128));
+        let mut shared = [row(1), row(1)];
+        shared[0].cols = 1;
+        shared[1].cols = 1;
+        shared[1].col = 1;
+        assert!(vertex_signature(&shared, 128));
+        shared[1].interp = 1;
+        assert!(!vertex_signature(&shared, 128));
+    }
 }

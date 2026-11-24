@@ -723,10 +723,16 @@ fn lane_triangle(threads: u32, first_vertex: u32) -> crate::NativeProgram {
 /// A live allocation at thread zero. Odd-numbered groups produce one
 /// triangle, even-numbered groups produce none. The positions use the first
 /// three threads and connectivity uses thread zero.
-fn allocated_triangle(first_lane_source: u32, allocator_thread: u32, count_mask: u32) -> crate::NativeProgram {
+fn allocated_triangle(
+    first_lane_source: u32,
+    allocator_thread: u32,
+    count_mask: u32,
+) -> crate::NativeProgram {
     let mut n = lane_triangle(128, 0);
-    let sop2 = |op:u32, dst:u32, a:u32, b:u32| 0x8000_0000 | op << 23 | dst << 16 | b << 8 | a;
-    let vop3 = |op:u32, dst:u32, a:u32, b:u32, c:u32| [0xd400_0000 | op << 16 | dst, a | b << 9 | c << 18];
+    let sop2 = |op: u32, dst: u32, a: u32, b: u32| 0x8000_0000 | op << 23 | dst << 16 | b << 8 | a;
+    let vop3 = |op: u32, dst: u32, a: u32, b: u32, c: u32| {
+        [0xd400_0000 | op << 16 | dst, a | b << 9 | c << 18]
+    };
     let restore = 0xbefe_04c1; // s_mov_b64 exec, -1
     let mut words = vec![restore];
     // Flat thread ID in v8 = (wave << 6) + mbcnt(all lanes).
@@ -745,7 +751,11 @@ fn allocated_triangle(first_lane_source: u32, allocator_thread: u32, count_mask:
     words.push(sop2(0x1e, 8, 7, 140)); // s8 = primitives << 12
     words.push(sop2(0x10, 8, 8, 6));
     words.extend([0xbefc_0308, 0xbf90_0009, restore]); // m0, alloc request, restore EXEC
-    let body: Vec<u32> = n.code.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    let body: Vec<u32> = n
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
     for word in body {
         match word {
             0xf800_00cf => words.extend(vop3(0x0d4, 126, 6, 264, 0)), // vertex < 3
@@ -756,22 +766,90 @@ fn allocated_triangle(first_lane_source: u32, allocator_thread: u32, count_mask:
             _ => {}
         }
         words.push(word);
-        if word == 0x0403_0201 { words.push(restore); }
+        if word == 0x0403_0201 {
+            words.push(restore);
+        }
     }
     n.vgprs = 16;
     n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
     n
 }
 
+fn attributed_triangle(conversion_source: u32) -> crate::NativeProgram {
+    use crate::native::{StageIo, Usage, VsOutput};
+    let mut n = allocated_triangle(6, 0, 1);
+    let StageIo::Ms(ms) = &mut n.io else {
+        unreachable!()
+    };
+    ms.outputs = vec![
+        VsOutput {
+            usage: Usage::Generic,
+            row: 1,
+            param: 0,
+            fp16: false,
+            pack2: false,
+        },
+        VsOutput {
+            usage: Usage::Generic,
+            row: 2,
+            param: 1,
+            fp16: true,
+            pack2: true,
+        },
+    ];
+    let mut words: Vec<_> = n
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    let pos = words.iter().position(|&w| w == 0xf800_00cf).unwrap();
+    let attributes = [
+        0xbe8c_03ff,
+        1f32.to_bits(),                  // s12 = 1.0
+        0x7e18_0e00 | conversion_source, // v12 = uint(float(src))
+        0x7e1a_050c,                     // s13 = firstlane(v12)
+        0x7e1a_0c0d,                     // v13 = float(s13)
+        0x7e1c_02ff,
+        0x3800_3400, // v14 packs .25, .5
+        0x7e1e_02ff,
+        0x3c00_3a00, // v15 packs .75, 1
+        0xf800_0201,
+        13, // param0.x = v13
+        0xf800_0213,
+        0x0f0e, // param1.xy = v14, v15
+    ];
+    // The surrounding cmpx keeps just three vertex lanes. Every lane
+    // arriving on the nonempty path sees the scalar source.
+    words.splice(
+        pos..pos,
+        std::iter::once(0xbf88_0000 | attributes.len() as u32).chain(attributes),
+    );
+    n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    n
+}
+
 #[test]
 fn mesh_allocation_requires_uniform_bounded_counts_and_thread_zero() {
-    let target = super::Target { lanes_min: 32, lanes_max: 32 };
-    let accepts = |src, thread, mask| super::tests::emit_for(&allocated_triangle(src, thread, mask), target)
-        .is_ok_and(|s| s.mesh_wave32_compatible);
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let accepts = |src, thread, mask| {
+        super::tests::emit_for(&allocated_triangle(src, thread, mask), target)
+            .is_ok_and(|s| s.mesh_wave32_compatible)
+    };
     assert!(accepts(6, 0, 1));
     assert!(!accepts(0, 0, 1)); // thread-local lane number
     assert!(!accepts(6, 1, 1)); // a different allocator
     assert!(!accepts(6, 0, 255)); // exceeds declared capacity
+    assert!(
+        super::tests::emit_for(&attributed_triangle(12), target)
+            .is_ok_and(|s| s.mesh_wave32_compatible)
+    );
+    assert!(
+        !super::tests::emit_for(&attributed_triangle(256), target)
+            .is_ok_and(|s| s.mesh_wave32_compatible)
+    );
 }
 
 #[test]
@@ -783,47 +861,82 @@ fn wave64_mesh_halves_rasterize_reference_triangle() {
     assert_eq!((target.lanes_min, target.lanes_max), (32, 32));
     let path = super::validator::Validator::default_path();
     let mut validator = super::validator::Validator::load(path.as_deref()).unwrap();
-    let pc = std::env::var_os("VICTORY_PC_DXC").map(PathBuf::from)
-        .or_else(|| path.map(|p| p.with_file_name("dxc.exe"))).unwrap();
+    let pc = std::env::var_os("VICTORY_PC_DXC")
+        .map(PathBuf::from)
+        .or_else(|| path.map(|p| p.with_file_name("dxc.exe")))
+        .unwrap();
     let dir = std::env::temp_dir().join(format!("victory-mesh-halves-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let reference = MS_CASES.iter().find(|c| c.0 == "one triangle").unwrap();
     let pc_mesh = compile(&pc, &dir, reference.2, "ms", "ms_6_5");
-    let ps = compile(&pc, &dir, r#"[RootSignature(RS)]
-        float4 mflat() : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }"#, "mflat", "ps_6_5");
+    let ps = compile(
+        &pc,
+        &dir,
+        r#"[RootSignature(RS)]
+        float4 mflat() : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }"#,
+        "mflat",
+        "ps_6_5",
+    );
     // SAFETY: PC DXC embeds the root signature in the compiled reference shader.
-    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &pc_mesh) }.unwrap();
-    let draw = |mesh: &[u8], groups| {
-        let pso = host.mesh_pipeline_with(&root, mesh, &ps).unwrap();
-        host.draw(&root, &pso, &Draw {
-            roots: vec![(0, Root::Constants(vec![0; 4]))],
-            textures: &[], samplers: &[], vertices: &[], stride: 0,
-            size: (32, 32), mesh_groups: groups,
-        }).unwrap()
+    let root: ID3D12RootSignature =
+        unsafe { host.device.CreateRootSignature(0, &pc_mesh) }.unwrap();
+    let draw_with = |mesh: &[u8], pixel: &[u8], groups| {
+        let pso = host.mesh_pipeline_with(&root, mesh, pixel).unwrap();
+        host.draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![(0, Root::Constants(vec![0; 4]))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (32, 32),
+                mesh_groups: groups,
+            },
+        )
+        .unwrap()
     };
+    let draw = |mesh: &[u8], groups| draw_with(mesh, &ps, groups);
     let expected = draw(&pc_mesh, 1);
     assert_eq!(expected.len(), 32 * 32);
     assert!(expected.iter().all(|p| *p == [0.25, 0.5, 0.75, 1.0]));
 
-    let pos = super::container::signature(&[SigElement {
-        name: "SV_Position".into(), index: 0, kind: 3, comp: 9, interp: 0,
-        row: Some(0), col: 0, cols: 4, usage: 15, half: false,
-    }], false);
+    let pos = super::container::signature(
+        &[SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }],
+        false,
+    );
     let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &pos)]);
     let container = super::Container::parse(&bytes).unwrap();
     for (threads, first_vertex) in [(64, 0), (64, 32), (128, 96), (128, 64)] {
         let native = lane_triangle(threads, first_vertex);
         let ir = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let blocks = crate::structure::structure(&ir).unwrap();
-        let resources = crate::resource::track(&ir, &native.layout, native.stage, Some(&blocks)).unwrap();
+        let resources =
+            crate::resource::track(&ir, &native.layout, native.stage, Some(&blocks)).unwrap();
         let io = crate::io::raise(&ir, &native).unwrap();
-        let mut ms = super::emit(&container, &native, &ir, &blocks, &io, &resources, target).unwrap();
+        let mut ms =
+            super::emit(&container, &native, &ir, &blocks, &io, &resources, target).unwrap();
         assert!(ms.mesh_wave32_compatible);
         validator.validate(&mut ms.dxil).unwrap();
         let pixels = draw(&ms.dxil, 1);
         assert_eq!(pixels.len(), expected.len());
-        assert_eq!(pixels.iter().position(|p| *p != expected[0]), None,
-            "threads={threads}, first_vertex={first_vertex}");
+        assert_eq!(
+            pixels.iter().position(|p| *p != expected[0]),
+            None,
+            "threads={threads}, first_vertex={first_vertex}"
+        );
     }
     let n = allocated_triangle(6, 0, 1);
     let ir = crate::ir::build(&n.code, n.wave64, n.vgprs).unwrap();
@@ -835,6 +948,54 @@ fn wave64_mesh_halves_rasterize_reference_triangle() {
     validator.validate(&mut ms.dxil).unwrap();
     assert!(draw(&ms.dxil, 1).iter().all(|p| *p == [0.0; 4]));
     assert_eq!(draw(&ms.dxil, 2), expected);
+    let n = attributed_triangle(12);
+    let element = |name: &str, index, row, cols, kind| SigElement {
+        name: name.into(),
+        index,
+        kind,
+        comp: 9,
+        interp: 0,
+        row: Some(row),
+        col: 0,
+        cols,
+        usage: (1 << cols) - 1,
+        half: false,
+    };
+    let mut outputs = super::container::signature(
+        &[
+            element("SV_Position", 0, 0, 4, 3),
+            element("COLOR", 0, 1, 1, 0),
+            element("TEXCOORD", 0, 2, 2, 0),
+            element("TEXCOORD", 1, 3, 2, 0),
+        ],
+        false,
+    );
+    for row in [2, 3] {
+        // The console emits 16-bit float here. The PC signature writer
+        // deliberately widens it, so supply the native type for translation.
+        let at = 8 + 32 * row + 16;
+        outputs[at..at + 4].copy_from_slice(&6u32.to_le_bytes());
+    }
+    let container_bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &outputs)]);
+    let container = super::Container::parse(&container_bytes).unwrap();
+    let ir = crate::ir::build(&n.code, n.wave64, n.vgprs).unwrap();
+    let st = crate::structure::structure(&ir).unwrap();
+    let res = crate::resource::track(&ir, &n.layout, n.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&ir, &n).unwrap();
+    let mut stage = super::emit(&container, &n, &ir, &st, &io, &res, target).unwrap();
+    assert!(stage.mesh_wave32_compatible);
+    validator.validate(&mut stage.dxil).unwrap();
+    let material = compile(
+        &pc,
+        &dir,
+        r#"[RootSignature(RS)]
+        float4 mpair(float scale : COLOR0, float2 a : TEXCOORD0, float2 b : TEXCOORD1) : SV_Target {
+            return scale * float4(a,b);
+        }"#,
+        "mpair",
+        "ps_6_5",
+    );
+    assert_eq!(draw_with(&stage.dxil, &material, 2), expected);
     let _ = std::fs::remove_dir_all(dir);
 }
 
