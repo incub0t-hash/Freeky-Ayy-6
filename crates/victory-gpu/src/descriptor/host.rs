@@ -186,6 +186,7 @@ impl HostHeap {
             }
         };
         let aliases = if sampler { 0 } else { ALIASES };
+        let guard = u32::from(!sampler);
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
@@ -196,16 +197,16 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC + aliases) {
+        } else if let Ok(heap) = make(count + DYNAMIC + aliases + guard) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC + aliases) {
+            match make(count + MIN_DYNAMIC + aliases + guard) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC + aliases > PORTABLE_VIEWS => {
+                Err(e) if count + MIN_DYNAMIC + aliases + guard > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC - aliases, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC - aliases - guard, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -225,14 +226,14 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra + aliases) * u64::from(step),
+            u64::from(count + extra + aliases + guard) * u64::from(step),
             u64::from(step),
             sampler,
         ));
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            StrideTable::new(&host.device, count + extra + guard)
         };
         let h = HostHeap {
             heap,
@@ -245,7 +246,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
-            alias_base: count + extra,
+            alias_base: count + extra + guard,
             aliases: Mutex::new(Aliases {
                 of: HashMap::new(),
                 free: Vec::new(),
@@ -257,7 +258,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra + aliases) {
+        if let Err(e) = h.fill_null(kind, count + extra + aliases + guard) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         if !sampler {
@@ -1690,6 +1691,43 @@ mod allocation_search_regression {
         assert_eq!(
             contiguous_dynamic_fit(&occupied, 6, 4),
             None
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod guard_layout_regression {
+    use super::*;
+
+    #[test]
+    fn guard_is_outside_dynamic_and_alias_allocations() {
+        let h = HostHeap::new(false, 8)
+            .expect("hardware descriptor heap");
+
+        let guard = h.count + h.dynamic;
+
+        assert_eq!(h.alias_base, guard + 1);
+
+        let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
+
+        assert_eq!(total, h.alias_base + ALIASES);
+
+        let metadata = h.strides.as_ref()
+            .expect("runtime stride metadata");
+
+        assert!(guard < metadata.len);
+
+        let first = h.dynamic(h.dynamic)
+            .expect("complete dynamic range");
+
+        assert_eq!(first, h.count);
+        assert_eq!(first + h.dynamic, guard);
+        assert!(h.dynamic(1).is_none());
+
+        println!(
+            "Verified: dynamic={}, guard={}, alias_base={}, total={}",
+            h.dynamic, guard, h.alias_base, total
         );
     }
 }
