@@ -599,40 +599,84 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+// A writer unmaps entire Windows views, including the surviving ends it must
+// remap. xmem supplies that full virtual interval under its physical-map lock.
+// Repeated stripes can make unrelated mappings wait, but every overlapping
+// address always shares a lock. Acquire every set in ascending lock order.
+const STRIPE_SHIFT: u32 = 22;
+const STRIPES: usize = u32::BITS as usize;
+static MAPPING: [std::sync::RwLock<()>; STRIPES] = [const { std::sync::RwLock::new(()) }; STRIPES];
+
+fn range_mapping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_RANGE_MAPPING").is_some_and(|value| value == "1");
+        tracing::info!(enabled, "range locking for streamed texture reads");
+        enabled
+    })
+}
+
+fn stripes(at: usize, len: usize) -> u32 {
+    if len == 0 { return 0; }
+    let first = at >> STRIPE_SHIFT;
+    let last = at.saturating_add(len - 1) >> STRIPE_SHIFT;
+    let count = (last - first + 1).min(STRIPES);
+    (u32::MAX >> (STRIPES - count)).rotate_left((first % STRIPES) as u32)
+}
+
+fn range_locks(at: usize, len: usize) -> u32 {
+    if range_mapping() { stripes(at, len) } else { 1 }
+}
+
+fn acquire<G>(mut mask: u32, mut take: impl FnMut(usize) -> Option<G>) -> Option<[Option<G>; STRIPES]> {
+    let mut guards = [const { None }; STRIPES];
+    while mask != 0 {
+        let i = mask.trailing_zeros() as usize;
+        guards[i] = Some(take(i)?);
+        mask &= mask - 1;
+    }
+    Some(guards)
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] [Option<std::sync::RwLockWriteGuard<'static, ()>>; STRIPES]);
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    title_memory_remapping_range(0, usize::MAX)
+}
+
+/// Excludes in-place readers of every view touched by this replacement.
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
+    Remapping(acquire(range_locks(at, len), |i| Some(MAPPING[i].write().unwrap_or_else(|e| e.into_inner()))).unwrap())
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] [Option<std::sync::RwLockReadGuard<'static, ()>>; STRIPES]);
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(0, usize::MAX)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+/// Holds the title mappings covering the bytes the caller will dereference.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    Reading(acquire(range_locks(at, len), |i| Some(MAPPING[i].read().unwrap_or_else(|e| e.into_inner()))).unwrap())
+}
+
+pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    acquire(range_locks(at, len), |i| match MAPPING[i].try_read() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
         Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    }).map(Reading)
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1060,6 +1104,24 @@ mod tests {
 #[cfg(test)]
 mod mapping_tests {
     use super::{title_memory_reading, title_memory_remapping};
+
+    #[test]
+    fn overlapping_mapping_stripes_exclude_reads_and_release_partial_acquisitions() {
+        let stripe = 1usize << super::STRIPE_SHIFT;
+        let total = stripe * super::STRIPES;
+        let locks: [std::sync::RwLock<()>; super::STRIPES] = std::array::from_fn(|_| Default::default());
+        let read = |at, len| super::acquire(super::stripes(at, len), |i| locks[i].try_read().ok());
+        assert_eq!(super::stripes(7, 0), 0);
+        assert_eq!(super::stripes(0, total), u32::MAX);
+        assert_eq!(super::stripes(total - 1, 2), (1 << 31) | 1);
+        let changed = locks[1].write().unwrap();
+        assert!(read(stripe - 1, 2).is_none());
+        assert!(locks[0].try_write().is_ok(), "failed try-read retained a lower lock");
+        assert!(read(2 * stripe, stripe).is_some(), "unrelated reads can run");
+        assert!(read(stripe, 1).is_none());
+        drop(changed);
+        assert!(read(stripe - 1, 2).is_some());
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
