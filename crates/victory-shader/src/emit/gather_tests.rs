@@ -144,15 +144,21 @@ fn chain() -> Vec<[f32; 4]> {
 /// What the console's gather returns to lane `lane` with texel offset
 /// `offset`: the 2x2 texels around the lane's coordinates at the nearest
 /// level (within the chain), clamped to the edges, in gather order.
-fn expected(lane: u32, base: u32, max_lod: u32, wrap: bool, offset: (i32, i32)) -> [f32; 4] {
+fn expected(lane: u32, base: u32, max_lod: u32, mode: u32, offset: (i32, i32)) -> [f32; 4] {
     let u = (lane & 7) as f32 * 0.125 + 0.03;
     let v = 1.0 - u;
     let level = (base + (lane >> 3).min(max_lod)).min(LEVELS - 1);
     let side = (SIDE >> level).max(1) as i32;
     let first = |c: f32, o: i32| (c * side as f32 - 0.5).floor() as i32 + o;
     let (i0, j0) = (first(u, offset.0), first(v, offset.1));
-    let coord = |x: i32| if wrap { x.rem_euclid(side) } else { x.clamp(0, side - 1) } as u32;
-    let at = |i: i32, j: i32| texel(level, coord(i), coord(j));
+    let coord = |x: i32| if mode == 0 { x.rem_euclid(side) } else { x.clamp(0, side - 1) } as u32;
+    let at = |i: i32, j: i32| {
+        if mode == 6 && (!(0..side).contains(&i) || !(0..side).contains(&j)) {
+            0.0
+        } else {
+            texel(level, coord(i), coord(j))
+        }
+    };
     [
         at(i0, j0 + 1),
         at(i0 + 1, j0 + 1),
@@ -207,27 +213,43 @@ fn run(shader: &HostShader, base: u32) -> Vec<(&'static str, Vec<[f32; 4]>)> {
 
 #[test]
 fn gather_reads_selected_mip_with_sampler_and_view_bounds() {
-    for (base, max_lod, wrap, body, offset) in [
-        (0, 3, false, GATHER4_L, (0, 0)),
-        (1, 3, true, GATHER4_L_O, (1, -1)),
-        (0, 1, false, GATHER4_L_O, (1, -1)),
-        (1, 0, false, GATHER4_L, (0, 0)),
+    for (base, max_lod, mode, filter, body, offset) in [
+        (0, 3, 2, 1 << 26, GATHER4_L, (0, 0)),
+        (1, 3, 0, 1 << 26, GATHER4_L_O, (1, -1)),
+        (0, 1, 2, 1 << 26, GATHER4_L_O, (1, -1)),
+        (1, 0, 2, 1 << 26, GATHER4_L, (0, 0)),
+        // Trilinear, border addressing, mip pre-clamp: each returned value
+        // is still one whole texel or the border, including the moved footprint.
+        (0, 12, 6, 0x1850_0000, GATHER4_L_O, (1, -1)),
     ] {
-        let address = if wrap { 0 } else { 2 | (2 << 3) };
-        let sampler = [address, max_lod << 20, 1 << 26, 0];
+        let address = mode | (mode << 3) | (mode << 6);
+        let sampler = [address, max_lod << 20, filter, 0];
         let shader = build(body, Some(sampler)).unwrap();
-        let want: Vec<_> = (0..32).map(|l| expected(l, base, max_lod, wrap, offset)).collect();
+        assert_eq!(shader.static_samplers.len(), 1);
+        assert_eq!(shader.static_samplers[0].filter, 0); // point, irrespective of ordinary filtering
+        let want: Vec<_> = (0..32).map(|l| expected(l, base, max_lod, mode, offset)).collect();
         for (label, got) in run(&shader, base) {
-            assert_eq!(got, want, "{label}, base {base}, max_lod {max_lod}, wrap {wrap}");
+            assert_eq!(got, want, "{label}, base {base}, max_lod {max_lod}, mode {mode}");
         }
     }
+}
+
+#[test]
+fn gather_and_comparison_sample_have_distinct_sampler_bindings() {
+    let mut body = GATHER4_L.to_vec();
+    // image_sample_c_lz v12, v[2:4], s[12:19], s[8:11] dmask:0x1 dim:2D
+    body.extend_from_slice(&[0xf0bc_0108, 0x0043_0c02]);
+    let sampler = [0, 3 << 20, 1 << 26, 0];
+    let shader = build(&body, Some(sampler)).unwrap();
+    let filters: Vec<_> = shader.static_samplers.iter().map(|s| s.filter).collect();
+    assert_eq!(filters, [0, 0x80]);
 }
 
 #[test]
 fn gather_refuses_unknown_sampler_and_fractional_mip_rules() {
     let reason = |body: &[u32], sampler| build(body, sampler).err().expect("expected refusal");
     assert!(reason(GATHER4_L, None).contains("runtime sampler"));
-    assert!(reason(GATHER4_L, Some([0, 3 << 20, 2 << 26, 0])).contains("sampler state"));
+    assert!(reason(GATHER4_L, Some([0, 3 << 20, 0x0460_0000, 0])).contains("sampler state"));
     let mut fractional = vec![0x1008_08ff, 1.2f32.to_bits()]; // v_mul_f32 v4, 1.2, v4
     fractional.extend_from_slice(GATHER4_L);
     assert!(reason(&fractional, Some([0, 3 << 20, 1 << 26, 0])).contains("integral LOD"));

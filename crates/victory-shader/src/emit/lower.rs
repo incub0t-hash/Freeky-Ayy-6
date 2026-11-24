@@ -1354,6 +1354,11 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
+            // Ordinary interpolation pairs consume no raw coordinate. Only
+            // materialize this optional host input if a live use asks for it.
+            Input::Barycentric { kind: Barycentric::PerspectiveCenter, .. } => {
+                return Val::Missing(CENTER_BARY);
+            }
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
@@ -1497,18 +1502,48 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A live, raw GFX10 perspective-center I/J is the second/third weight
+    /// of the triangle. DXIL supplies all three through a special, unpacked
+    /// signature input. Hardware interpolation of ordinary attributes stays
+    /// independent of the optional SV_Barycentrics capability.
+    fn live_input(&mut self, v: Value) -> Option<Val> {
+        let stored = self.vals.get(&v).copied()?;
+        if !matches!(stored, Val::Missing(CENTER_BARY)) {
+            return Some(stored);
+        }
+        let index = self.x.io.inputs.iter().find_map(|&(value, input)| {
+            match input {
+                Input::Barycentric { kind: Barycentric::PerspectiveCenter, index: index @ 0..=1 }
+                    if value == v => Some(index),
+                _ => None,
+            }
+        })?;
+        let id = self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == 2)
+            .unwrap_or_else(|| {
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(), index: 0, kind: 28, comp: 9,
+                    interp: 2, row: None, col: 0, cols: 3, usage: 0, half: false,
+                });
+                self.s.inputs.len() - 1
+            });
+        self.s.flags |= flags::BARYCENTRICS;
+        let val = self.load_any_input(id, index + 1);
+        self.vals.insert(v, val);
+        Some(val)
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
-        match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
+        match self.live_input(v) {
+            Some(Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
-            Some(&val) => return Ok(val),
+            Some(Val::Missing(w)) => return Err(w),
+            Some(val) => return Ok(val),
             None => {}
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
@@ -3870,16 +3905,20 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                let comparison = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().enumerate().position(|(i, w)| {
+                    *w == words && (self.s.cmp_samplers & (1u64 << i) != 0) == comparison
+                }) {
                     Some(n) => n,
                     None => {
+                        if self.samplers.len() >= 64 {
+                            return Err("more than 64 static samplers");
+                        }
                         self.samplers.push(words);
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
+                if comparison {
                     self.s.cmp_samplers |= 1 << n;
                 }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
@@ -6464,7 +6503,16 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let explicit_gather = if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+                if kind != 2 || *unorm || *a16 || *d16 {
+                    return Err("an explicit-level gather outside normalized 2D with 32-bit operands");
+                }
+                Some(Self::gather_sampler(ss)?)
+            } else {
+                None
+            };
+            let sampler_source = explicit_gather.as_ref().map_or(ss, |(_, point)| point);
+            let sh = self.handle(site, sampler_source, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -6651,29 +6699,7 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
-                    if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
-                        if kind != 2 || *unorm || *a16 || *d16 {
-                            return Err("an explicit-level gather outside normalized 2D with 32-bit operands");
-                        }
-                        let Source::Constant(words) = ss else {
-                            return Err("an explicit-level gather with a runtime sampler");
-                        };
-                        let words: [u32; 4] = words.as_slice().try_into()
-                            .map_err(|_| "an explicit-level gather with incomplete sampler state")?;
-                        let sampler = super::StaticSampler::from_words(words);
-                        // Require ordinary point sampling, known address modes, no
-                        // LOD bias, no reduction or custom border. The last possible
-                        // mip of a D3D12 2D texture (16,384 texels) is level 14.
-                        if words[0] & !0x71ff != 0
-                            || (0..2).any(|axis| !matches!(words[0] >> (axis * 3) & 7, 0 | 1 | 2))
-                            || !matches!(words[2], 0 | 0x0400_0000)
-                            || words[1] >> 24 != 0 || words[3] != 0
-                            || sampler.min_lod.fract() != 0.0
-                            || sampler.max_lod.min(14.0).fract() != 0.0
-                            || sampler.min_lod > sampler.max_lod
-                        {
-                            return Err("an explicit-level gather with unsupported sampler state");
-                        }
+                    if let Some((sampler, _)) = explicit_gather {
                         // The level follows the coordinates.
                         let lod = addr_val(self, first + coords)?;
                         let lod = to_float(self, lod);
@@ -6774,6 +6800,32 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Four unfiltered reads need the original addressing and border colour,
+    /// even when the same title sampler filters ordinary samples linearly.
+    fn gather_sampler(src: &Source) -> Result<(super::StaticSampler, Source), Why> {
+        let Source::Constant(words) = src else {
+            return Err("an explicit-level gather with a runtime sampler");
+        };
+        let mut words: [u32; 4] = words.as_slice().try_into()
+            .map_err(|_| "an explicit-level gather with incomplete sampler state")?;
+        let sampler = super::StaticSampler::from_words(words);
+        let mip = words[2] >> 26 & 3;
+        // Normalized coordinates, point or linear XY/mip filters and known
+        // address modes. An integer LOD and integer effective sampler bounds
+        // make MIP_POINT_PRECLAMP immaterial. 2D texture mips end by level 14.
+        if words[0] & !0x71ff != 0
+            || (0..2).any(|axis| !matches!(words[0] >> (axis * 3) & 7, 0 | 1 | 2 | 6))
+            || words[2] & !0x1c50_0000 != 0 || mip == 3
+            || words[1] >> 24 != 0 || !matches!(words[3], 0 | 0x4000_0000 | 0x8000_0000)
+            || sampler.min_lod.fract() != 0.0 || sampler.max_lod.min(14.0).fract() != 0.0
+            || sampler.min_lod > sampler.max_lod
+        {
+            return Err("an explicit-level gather with unsupported sampler state");
+        }
+        words[2] = u32::from(mip != 0) << 26;
+        Ok((sampler, Source::Constant(words.to_vec())))
     }
 
     /// A gather at an explicit level (`image_gather4_l`, `_l_o`): channel
@@ -7855,7 +7907,12 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let value = if self.read_phis.contains(&phi.value) {
+                    self.live_input(arg)
+                } else {
+                    self.vals.get(&arg).copied()
+                };
+                let x = match (value, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
