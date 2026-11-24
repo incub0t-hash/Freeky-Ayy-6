@@ -15,7 +15,7 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Index of the user-selected stage, when this is an actual creation.
+    priority_stage: Option<usize>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -42,7 +44,7 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>, priority_stage: Option<usize>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -56,15 +58,40 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            priority_stage,
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            self.log_priority(Some(made.is_some()));
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    fn log_priority(&self, ready: Option<bool>) {
+        let Some(index) = self.priority_stage else { return };
+        // Titles can create multiple objects with the same stages and state.
+        // Record the submission and its outcome once for each distinct key.
+        static EVENTS: Mutex<BTreeMap<String, u8>> = Mutex::new(BTreeMap::new());
+        let bit = match ready { None => 1, Some(true) => 2, Some(false) => 4 };
+        let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = events.entry(self.key.clone()).or_default();
+        if *seen & bit != 0 { return; }
+        *seen |= bit;
+        drop(events);
+        let shader = &self.shaders[index];
+        if let Some(ready) = ready {
+            tracing::info!(key = %self.key, stage = shader.stage, hash = %shader.hash, ready,
+                "selected stage pipeline compilation finished");
+        } else {
+            tracing::info!(key = %self.key, stage = shader.stage, hash = %shader.hash,
+                "selected stage pipeline queued at creation");
+        }
     }
 }
 
@@ -140,7 +167,11 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.priority_stage.is_some() {
+        p.log_priority(None);
+        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        start(p, SELECTED);
+    } else if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -215,19 +246,19 @@ fn wait(p: &Pending, frame: u64) {
 
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const SELECTED: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
-    early: VecDeque<Arc<Pending>>,
-    requested: VecDeque<Arc<Pending>>,
+    /// FIFO at each level, from ordinary prewarm to a real draw request.
+    levels: [VecDeque<Arc<Pending>>; 3],
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
-            early: VecDeque::new(),
-            requested: VecDeque::new(),
+            levels: [const { VecDeque::new() }; 3],
         }
     }
 
@@ -239,22 +270,22 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
-        }
+        self.levels[usize::from(priority - EARLY)].push_back(p.clone());
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        for (i, level) in self.levels.iter_mut().enumerate().rev() {
+            let priority = EARLY + i as u8;
+            while let Some(p) = level.pop_front() {
+                // Promotion leaves a stale entry at its old level.
+                if p.queue_state.load(Ordering::Relaxed) == priority {
+                    p.queue_state.store(MAKING, Ordering::Relaxed);
+                    return Some(p);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -357,7 +388,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), None, None));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
@@ -369,7 +400,7 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
-        let mut p = Pending::new(Vec::new(), None);
+        let mut p = Pending::new(Vec::new(), None, None);
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
         p.queue_state.store(MAKING, Ordering::Relaxed);
@@ -383,19 +414,27 @@ mod tests {
 
     #[test]
     fn draws_promote_early_pipelines_without_claiming_them_twice() {
-        let earlier = Arc::new(Pending::new(Vec::new(), None));
-        let promoted = Arc::new(Pending::new(Vec::new(), None));
-        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let earlier = Arc::new(Pending::new(Vec::new(), None, None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None, None));
+        let requested = Arc::new(Pending::new(Vec::new(), None, None));
+        let selected = Arc::new(Pending::new(Vec::new(), None, None));
+        let drawn_selected = Arc::new(Pending::new(Vec::new(), None, None));
         let mut queue = Queue::new();
 
         assert_eq!(queue.push(&earlier, EARLY), Some(true));
         assert_eq!(queue.push(&promoted, EARLY), Some(true));
+        assert_eq!(queue.push(&selected, SELECTED), Some(true));
+        assert_eq!(queue.push(&drawn_selected, EARLY), Some(true));
+        assert_eq!(queue.push(&drawn_selected, SELECTED), Some(false));
         assert_eq!(queue.push(&requested, REQUESTED), Some(true));
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        assert_eq!(queue.push(&drawn_selected, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &drawn_selected));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &selected));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());

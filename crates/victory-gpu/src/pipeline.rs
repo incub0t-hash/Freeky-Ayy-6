@@ -416,8 +416,8 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+#[cfg(windows)]
+fn parse_shader_hashes(setting: &str, value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -428,7 +428,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             } else {
                 tracing::warn!(
                     hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    setting, "expected a 16-digit shader hash"
                 );
                 None
             }
@@ -441,7 +441,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_shader_hashes("VICTORY_SKIP_PIPELINES", &value)
     });
     if hashes.is_empty() {
         return None;
@@ -504,6 +504,14 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     }))
 }
 
+#[cfg(windows)]
+fn priority_stage(shaders: &[Arc<Shader>], selected: &[String], iid: *const Iid, out: *mut This) -> Option<usize> {
+    if selected.is_empty() || out.is_null() || !object::is(iid, &PIPELINE_IIDS) {
+        return None;
+    }
+    shaders.iter().position(|s| selected.contains(&s.hash))
+}
+
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
@@ -512,7 +520,15 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        const SETTING: &str = "VICTORY_PRIORITY_SHADERS";
+        static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+        let selected = HASHES.get_or_init(|| {
+            parse_shader_hashes(SETTING, &std::env::var(SETTING).unwrap_or_default())
+        });
+        let priority = priority_stage(&shaders, selected, iid, out);
+        Arc::new(make::Pending::new(shaders.clone(), graphics, priority))
+    };
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -734,12 +750,26 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn stage_priority_requires_a_matching_shader_and_a_real_creation() {
+        let stages = [shader("vertex", b"example vertex"), shader("pixel", b"example pixel")];
+        let hashes = vec![stages[1].hash.clone()];
+        let mut out = std::ptr::null();
+        let iid = &PIPELINE_IIDS[0];
+        assert_eq!(priority_stage(&stages, &hashes, iid, &mut out), Some(1));
+        assert_eq!(priority_stage(&stages[..1], &hashes, iid, &mut out), None);
+        assert_eq!(priority_stage(&stages, &[], iid, &mut out), None);
+        assert_eq!(priority_stage(&stages, &hashes, iid, std::ptr::null_mut()), None);
+        assert_eq!(priority_stage(&stages, &hashes, std::ptr::null(), &mut out), None);
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_shader_hashes("test", " , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_shader_hashes("test", " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }
