@@ -1339,6 +1339,24 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// Reads the mirrored key and the resource it actually retains under the
+    /// same lock order as mirror(). Does not create a resource or a heap.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn observed_slot(&self, index: u32) -> Result<(u64, Option<String>), &'static str> {
+        // Submission may hold the queue mutex. Never wait on a recorder that
+        // is replacing a slot and retiring the previous resource.
+        let made = self.made.try_lock().map_err(|_| "host mirror busy")?;
+        let key = *made.get(index as usize).ok_or("outside host heap")?;
+        let kept = self.kept.try_lock().map_err(|_| "host resource busy")?;
+        let desc = kept.get(index as usize).ok_or("outside host heap")?.as_ref().map(|resource| {
+            // SAFETY: kept owns a COM reference to this resource.
+            let d = unsafe { resource.GetDesc() };
+            format!("dim={} width={} height={} depth_or_layers={} mips={} format={}",
+                d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0)
+        });
+        Ok((key, desc))
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.

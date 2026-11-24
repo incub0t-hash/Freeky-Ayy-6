@@ -2292,6 +2292,30 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn puddle_observation_identifies_real_texture_and_nonzero_view_mip() {
+        let null = std::ptr::null();
+        let mut resource = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &texture(96, 64, 28, 6),
+            0, null.cast(), &RESOURCE_IIDS[0], &mut resource), S_OK);
+        let heap = crate::descriptor::host::HostHeap::new(false, 3).expect("host view heap");
+        let mut record = [0u64; 4];
+        let handle = record.as_mut_ptr() as u64;
+        let desc = [28, 4, 5768, 0, 2, 3, 0, 0, 0, 0];
+        crate::descriptor::create_srv(null, resource, &desc, handle);
+        let (key, view) = crate::descriptor::observation::view(handle).unwrap();
+        assert_eq!(view, crate::descriptor::View::Shader(resource as usize, Some(desc)));
+        assert_eq!(heap.mirror(2, handle, true), Some(view));
+        let (mirrored, description) = heap.observed_slot(2).unwrap();
+        assert_eq!(mirrored, key);
+        let description = description.expect("the mirrored view retained a real resource");
+        assert!(description.contains("dim=3 width=96 height=64 depth_or_layers=1 mips=6"), "{description}");
+        assert_eq!(heap.observed_slot(3), Err("outside host heap"));
+        drop(heap);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource), 0);
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
