@@ -1558,3 +1558,240 @@ fn translated_pixel_raster_oracle() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+
+#[test]
+fn translated_mesh_raster_oracle() {
+    use crate::native::{NativeProgram, HwStage, StageIo, MeshIo};
+    use super::container::SigElement;
+
+    fn vop3(op: u32, dst: u32, a: u32, b: u32, c: u32) -> [u32; 2] {
+        [
+            0xD400_0000 | (op << 16) | dst,
+            a | (b << 9) | (c << 18),
+        ]
+    }
+
+    fn literal(words: &mut Vec<u32>, reg: u32, value: u32) {
+        words.extend([
+            0x7E00_02FF | (reg << 17),
+            value,
+        ]);
+    }
+
+    fn select(
+        words: &mut Vec<u32>,
+        dst: u32,
+        lane: u32,
+        alternate: u32,
+    ) {
+        // Compare the logical lane index with the selected lane.
+        words.extend(vop3(0x0C2, 10, 128 + lane, 256, 0));
+
+        // Select the alternate VGPR when the comparison succeeds.
+        words.extend(vop3(
+            0x101, dst, 256 + dst, 256 + alternate, 10
+        ));
+    }
+
+    let pc = std::env::var_os("VICTORY_PC_DXC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            super::validator::Validator::default_path()
+                .map(|p| p.with_file_name("dxc.exe"))
+        })
+        .expect("PC DXC required");
+
+    let host = Host::on("RTX 3080 Ti")
+        .expect("NVIDIA hardware required");
+
+    let dir = std::env::temp_dir().join(
+        format!("victory-mesh-raster-{}", std::process::id())
+    );
+
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let reference = MS_CASES.iter()
+        .find(|c| c.0 == "one triangle")
+        .unwrap();
+
+    let native_ms = compile(
+        &pc, &dir, reference.2, "ms", "ms_6_5"
+    );
+
+    let root: ID3D12RootSignature = unsafe {
+        host.device.CreateRootSignature(0, &native_ms)
+    }.unwrap();
+
+    let ps = compile(
+        &pc,
+        &dir,
+        r#"[RootSignature(RS)]
+        float4 mflat() : SV_Target {
+            return float4(0.25, 0.5, 0.75, 1.0);
+        }"#,
+        "mflat",
+        "ps_6_5",
+    );
+
+    let signature = super::container::signature(
+        &[SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }],
+        false,
+    );
+
+    let bytes = crate::dxbc::build(&[
+        (super::FourCC::OSG1, &signature),
+    ]);
+
+    let container = super::Container::parse(&bytes).unwrap();
+
+    for (wave64, threads, base) in [
+        (false, 32u32, 0u32),
+        (true, 64, 0),
+        (true, 64, 32),
+    ] {
+        let mut words = Vec::new();
+
+        // Recover the console's logical lane index.
+        words.extend(vop3(0x365, 0, 193, 128, 0));
+
+        if wave64 {
+            words.extend(vop3(0x366, 0, 193, 256, 0));
+        }
+
+        // Default position (-1, -1, 0.5, 1).
+        literal(&mut words, 1, (-1.0f32).to_bits());
+        literal(&mut words, 2, (-1.0f32).to_bits());
+        literal(&mut words, 3, 0.5f32.to_bits());
+        literal(&mut words, 4, 1.0f32.to_bits());
+        literal(&mut words, 5, 3.0f32.to_bits());
+
+        // Three vertices covering the viewport.
+        select(&mut words, 1, base + 1, 5);
+        select(&mut words, 2, base + 2, 5);
+
+        // Export vertex positions.
+        words.extend([
+            0xF800_00CF,
+            0x0403_0201,
+        ]);
+
+        // Unused primitives have zero area.
+        literal(&mut words, 6, 0);
+
+        let indices =
+            base | ((base + 1) << 10) | ((base + 2) << 20);
+
+        literal(&mut words, 7, indices);
+
+        // Only the selected lane emits a real triangle.
+        select(&mut words, 6, base, 7);
+
+        words.extend([
+            0xF800_0941,
+            0x0000_0006,
+            0xBF81_0000,
+        ]);
+
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads,
+                max_vertices: threads,
+                max_primitives: threads,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+
+        let ir = crate::ir::build(
+            &native.patched_code(),
+            wave64,
+            native.vgprs,
+        ).expect("Mesh instruction decoding");
+
+        let res = crate::resource::track(
+            &ir, &native.layout, native.stage,
+        ).unwrap();
+
+        let io = crate::io::raise(&ir, &native).unwrap();
+        let st = crate::structure::structure(&ir).unwrap();
+
+        let mut ms = super::emit(
+            &container, &native, &ir,
+            &st, &io, &res, host.target(),
+        ).expect("Mesh translation");
+
+        let path = super::validator::Validator::default_path();
+
+        let mut validator = super::validator::Validator::load(
+            path.as_deref()
+        ).expect("DXIL validator required");
+
+        validator.validate(&mut ms.dxil)
+            .expect("Translated mesh validation");
+
+        let pso = host.mesh_pipeline_with(
+            &root, &ms.dxil, &ps
+        ).expect("Translated mesh pipeline");
+
+        let pixels = host.draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![(0, Root::Constants(vec![0; 4]))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (32, 32),
+                mesh_groups: 1,
+            },
+        ).expect("Translated mesh raster readback");
+
+        assert_eq!(pixels.len(), 1024);
+
+        let expected = [0.25f32, 0.5, 0.75, 1.0];
+
+        for (i, pixel) in pixels.iter().enumerate() {
+            for c in 0..4 {
+                assert!(
+                    pixel[c].is_finite() &&
+                    (pixel[c] - expected[c]).abs() < 0.00001,
+                    "wave64={wave64}, base={base}, pixel={i}, \
+                     channel={c}: got {}, expected {}",
+                    pixel[c], expected[c]
+                );
+            }
+        }
+
+        println!(
+            "VERIFIED translated mesh: wave64={wave64}, \
+             threads={threads}, first_vertex={base}, \
+             {} pixels",
+            pixels.len()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
