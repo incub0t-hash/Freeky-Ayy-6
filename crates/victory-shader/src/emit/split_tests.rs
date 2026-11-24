@@ -601,6 +601,105 @@ fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
     p
 }
 
+fn two_wave_lds(firstlane: u32, body_op: u32) -> crate::NativeProgram {
+    let words = [
+        0x3408_0082, // v4 = 4 * thread.x
+        0x8f0e_8701, // s14 = group.x << 7
+        0x4a04_000e, // v2 = s14 + thread.x
+        0xd834_0000, 0x0000_0204, // LDS[thread.x] = global thread ID
+        0xbf8a_0000, // s_barrier
+        0xbe8a_047e, // save full EXEC
+        0x7da8_00c0, // EXEC = thread.x < 64
+        0xbf88_0007, // skip vector body if EXEC is empty
+        body_op,
+        0x4a0e_08ff, 256, // v7 = v4 + 256
+        0xd8d8_0000, 0x0700_0007, // v7 = LDS[64 + thread.x]
+        0xd834_0000, 0x0000_0704, // LDS[thread.x] = v7
+        0xbefe_040a, // restore EXEC
+        0x7e0c_02ff, 160, // all 128 threads read LDS[40]
+        0xd8d8_0000, 0x0100_0006,
+        firstlane,
+        0x7e04_0209, // v2 = s9
+        0x7d84_0080, // v_cmp_eq_u32 vcc,0,v0
+        0xbe8a_246a, // only thread zero commits the result
+    ];
+    program_lds(&words, 128)
+}
+
+#[test]
+fn two_wave_group_rejects_divergent_firstlane_and_barriers() {
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    let good = two_wave_lds(0x7e12_0501, 0xbf80_0000);
+    assert_eq!(wave_size(&emit_for(&good, target).unwrap().dxil), Some(32));
+    for invalid in [
+        two_wave_lds(0x7e12_0500, 0xbf80_0000), // firstlane of varying thread ID
+        two_wave_lds(0x7e12_0501, 0xbf8a_0000), // barrier reached by half the group
+    ] {
+        assert!(emit_for(&invalid, target).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires fixed-wave32 hardware"]
+fn two_wave_group_orders_shared_reduction_and_broadcast() {
+    let host = Host::new(false).unwrap();
+    assert!(!host.target().runs(64) && host.target().runs(32));
+    let shader = two_wave_lds(0x7e12_0501, 0xbf80_0000);
+    let mut expected = vec![0; 256];
+    expected[0] = 104;
+    expected[128] = 232;
+    assert_eq!(run(&host, &shader, 2).unwrap(), expected);
+    if let Some(files) = std::env::var_os("VICTORY_TEST_GROUP_CULL_CONTAINERS") {
+        let mut v = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ).unwrap();
+        for file in std::env::split_paths(&files) {
+            let mut cs = super::translate_for(&std::fs::read(file).unwrap(), host.target()).unwrap();
+            assert_eq!(wave_size(&cs.dxil), Some(32));
+            v.validate(&mut cs.dxil).unwrap();
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Two meshlet records select the same degenerate vertex at zero.
+            // Without the clip test both reserve an output. With the clip test
+            // their zero projected depth fails its strictly positive bound.
+            let zero = [0; 1024];
+            let mut frame = zero;
+            frame[17..19].fill(2f32.to_bits()); // HZB dimensions at byte 0x44
+            let mut table = zero;
+            table[0] = 64; // byte offset of the first meshlet header
+            fn raw(data: &[u32]) -> View<'_> {
+                View::Buffer { data, stride: super::host::Stride::Raw }
+            }
+            for (flags, depth, count) in [(0, 0., 2), (2, 0., 0), (4, 0., 2), (4, 1., 0)] {
+                let mut records = zero;
+                records[16] = (flags << 24) | 6; // vertex/meshlet SRV in heap slot 6
+                let texels = [[depth; 4]; 4];
+                let views = [
+                    raw(&frame),
+                    raw(&table),
+                    View::Texture(2, 2, &texels),
+                    View::HalfUav(8),
+                    View::RawUav(8),
+                    View::Cbv(&records),
+                    raw(&zero),
+                ];
+                let mut words = vec![0; cs.user_data_dwords() as usize];
+                for param in &cs.user_data {
+                    if param.root == RootType::Constants {
+                        words[param.index as usize] = [0, 5, 6, 6][param.dword as usize];
+                    }
+                }
+                let out = host.dispatch(&root, &pso, &Dispatch {
+                    roots: vec![(0, Root::Constants(words))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                }).unwrap();
+                assert_eq!(out[1], [count, 0, 0, 0, 0, 0, 0, 0], "flags {flags}, HZB depth {depth}");
+            }
+        }
+    }
+}
+
 /// One console wave sharing LDS without `s_barrier`: the console runs each
 /// instruction in all 64 lanes before the next, so a lane reads what a lane
 /// of the other half wrote one instruction earlier. Lane t writes t to
