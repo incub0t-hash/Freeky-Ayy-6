@@ -1376,8 +1376,8 @@ mod tests {
         {
             let slice = Slice { section: Arc::new(Section::new(3 * PAGE, Some(&dir)).unwrap()), index: 1 };
             assert!(!slice.section.reserved);
-            let mut first = View::map(&slice, 1).unwrap();
-            let mut second = View::map(&slice, 1).unwrap();
+            let mut first = View::persistent(&slice, 1).unwrap();
+            let mut second = View::temporary(&slice, 1).unwrap();
             drop(slice);
             assert!(first.bytes().iter().all(|&value| value == 0));
             first.bytes()[PAGE - 1] = 81;
