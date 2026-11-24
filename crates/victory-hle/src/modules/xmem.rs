@@ -10,8 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -345,6 +345,17 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     reserved: bool,
+    /// The section's whole range, mapped the first time one of its pages is
+    /// written and kept until the section goes; `None` once the host has
+    /// refused that mapping. See [`Section::persistent_ptr`].
+    persistent: OnceLock<Option<MappedBase>>,
+    /// The section's size in bytes.
+    size: usize,
+    /// One bit per 64 KiB page, set once the page is committed in the
+    /// persistent view. A saved call, not a guarantee: `commit` is
+    /// idempotent, so the DirectStorage workers may write this concurrently
+    /// and a lost race costs one redundant call.
+    committed: Box<[AtomicU64]>,
 }
 
 impl Section {
@@ -378,7 +389,15 @@ impl Section {
                 size as u32, std::ptr::null())
         };
         if handle.is_null() { return Err(std::io::Error::last_os_error()); }
-        Ok(Self { handle, reserved })
+        Ok(Self {
+            handle,
+            reserved,
+            persistent: OnceLock::new(),
+            size,
+            committed: (0..(size / PAGE).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        })
     }
 }
 
@@ -386,6 +405,114 @@ impl Section {
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
+
+impl Section {
+
+    /// The section's whole range, mapped read-write once and kept. A write
+    /// through it is a store; a view per write is a map, a commit and an
+    /// unmap, and every unmap flushes every processor's TLB.
+    ///
+    /// `None` when the host refuses the mapping, which the title's largest
+    /// allocation can provoke: it asks for 6.1 GiB at once, and this maps
+    /// all of it. Callers then keep the temporary view per write.
+    fn persistent_ptr(&self) -> Option<*mut u8> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: our section, mapped read-write; `MappedBase` owns the view
+        // and unmaps it when the section goes.
+        let mapped = self.persistent.get_or_init(|| {
+            let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, 0) };
+            if at.Value.is_null() {
+                tracing::warn!(
+                    size = self.size,
+                    error = %std::io::Error::last_os_error(),
+                    "mapping a physical-page section whole failed; its pages keep a temporary view per write"
+                );
+                return None;
+            }
+            Some(MappedBase(at.Value.cast()))
+        });
+        mapped.as_ref().map(|base| base.0)
+    }
+
+    /// Whether all of pages `[start, start + count)` are committed in the
+    /// persistent view.
+    fn committed_all(&self, start: usize, count: usize) -> bool {
+        let Some(end) = start.checked_add(count) else {
+            return false;
+        };
+        (start..end).all(|page| {
+            (self.committed[page / 64].load(Ordering::Relaxed) >> (page % 64)) & 1 != 0
+        })
+    }
+
+    /// Records pages `[start, start + count)` as committed in the persistent
+    /// view. A lost race only costs a call, so relaxed is enough.
+    fn mark_committed(&self, start: usize, count: usize) {
+        for page in start..start + count {
+            self.committed[page / 64].fetch_or(1u64 << (page % 64), Ordering::Relaxed);
+        }
+    }
+
+    /// Commits pages `[start_page, start_page + count)` of the persistent
+    /// view at `base`. A page committed before costs no call at all, which
+    /// is the point: the title commits every page it writes. False when the
+    /// range leaves the section or the host refuses.
+    ///
+    /// The `committed_all` early return is a saved call rather than a
+    /// correctness guard: `commit` over a committed page succeeds and
+    /// changes nothing. Probe run 2026-11-25 — with the branch forced off,
+    /// `cargo test -p victory-hle xmem::` still passes 16 of 16, so no test
+    /// can see it and this is the one surviving mutation. Its effect is
+    /// measured by a run (`VICTORY_XMEM_PERSISTENT_VIEW=1`), not asserted by
+    /// one, which is the deliberate choice recorded here.
+    fn ensure_committed(&self, base: *mut u8, start_page: usize, count: usize) -> bool {
+        let Some(end_page) = start_page.checked_add(count) else {
+            return false;
+        };
+        if !end_page
+            .checked_mul(PAGE)
+            .is_some_and(|end| end <= self.size)
+        {
+            return false;
+        }
+        if self.committed_all(start_page, count) {
+            return true;
+        }
+        // One commit for the whole range: pages committed before are left
+        // as they are, and `commit` reports a host at its commit limit
+        // exactly as the temporary path does.
+        // SAFETY: `[start_page, end_page)` lies inside the section's view.
+        let at = unsafe { base.add(start_page * PAGE) };
+        if self.reserved && !commit(at as usize, count * PAGE) {
+            return false;
+        }
+        self.mark_committed(start_page, count);
+        true
+    }
+}
+
+/// The section's whole range, mapped once and unmapped when the section
+/// goes rather than after every write.
+struct MappedBase(*mut u8);
+
+// SAFETY: a mapping may be written from any thread; its writers write bytes
+// of their own, the rule a title's own views of the same pages follow.
+unsafe impl Send for MappedBase {}
+// SAFETY: as above.
+unsafe impl Sync for MappedBase {}
+
+impl Drop for MappedBase {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // SAFETY: our view. Closing the section's handle first is safe: a
+        // view keeps the section object alive on its own.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.0.cast(),
+            });
+        }
+    }
+}
 
 impl Drop for Section {
     fn drop(&mut self) {
@@ -494,16 +621,83 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     1
 }
 
+/// Parses `VICTORY_XMEM_PERSISTENT_VIEW`: off unless the value says yes, so
+/// a run that sets nothing keeps the view per write. Opt-in while the
+/// persistent path settles, because it maps each section whole and keeps
+/// the mapping: 6.1 GiB of address space for the title's largest allocation.
+pub(crate) fn parse_persistent_views(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(text) = value.to_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+/// Whether pages are written through one persistent view per section
+/// (`VICTORY_XMEM_PERSISTENT_VIEW=1`) instead of a view mapped, committed
+/// and unmapped for every write.
+pub(crate) fn persistent_views() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_persistent_views(std::env::var_os("VICTORY_XMEM_PERSISTENT_VIEW").as_deref())
+    })
+}
+
+/// How a write reaches its pages: the process default ([`persistent_views`]),
+/// or one forced. Tests force either, since the environment is read once per
+/// process and cannot be set from a test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    Default,
+    Persistent,
+    Temporary,
+}
+
+impl Mapping {
+    /// The view `n` slices of `slice` on are written through.
+    fn view(self, slice: &Slice, n: usize) -> Option<View> {
+        let mapping = match self {
+            Mapping::Default if persistent_views() => Mapping::Persistent,
+            Mapping::Default => Mapping::Temporary,
+            forced => forced,
+        };
+        match mapping {
+            // The temporary path is the one every run before the persistent
+            // one used, so a host refusing either half of the persistent
+            // path lands there rather than failing a write.
+            Mapping::Persistent => View::persistent(slice, n).or_else(|| View::temporary(slice, n)),
+            _ => View::temporary(slice, n),
+        }
+    }
+}
+
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
-struct View {
-    at: MEMORY_MAPPED_VIEW_ADDRESS,
-    len: usize,
+/// writable.
+enum View {
+    /// Mapped for this write alone, unmapped when dropped.
+    Temporary {
+        at: MEMORY_MAPPED_VIEW_ADDRESS,
+        len: usize,
+    },
+    /// The section's persistent view, at `slice`'s pages. Nothing is unmapped
+    /// when this drops: the view belongs to the section and goes with it.
+    Persistent {
+        /// Keeps the section, and so the view, alive while the bytes are used.
+        _section: Arc<Section>,
+        ptr: *mut u8,
+        len: usize,
+    },
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
-    fn map(slice: &Slice, n: usize) -> Option<View> {
+    /// Maps `n` slices from `slice` on for this write alone.
+    fn temporary(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
@@ -519,23 +713,51 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View::Temporary { at, len };
         (!slice.section.reserved || commit(at.Value as usize, len)).then_some(view)
     }
 
+    /// The section's persistent view over `n` slices from `slice` on, those
+    /// pages committed; `None` when the host refuses either half, which
+    /// leaves the caller on [`View::temporary`].
+    fn persistent(slice: &Slice, n: usize) -> Option<View> {
+        let base = slice.section.persistent_ptr()?;
+        let len = n.checked_mul(PAGE)?;
+        if !slice.section.ensure_committed(base, slice.index, n) {
+            return None;
+        }
+        // SAFETY: `ensure_committed` proved `[slice.index, slice.index + n)`
+        // lies inside the section, so this is inside the section's view.
+        let ptr = unsafe { base.add(slice.index * PAGE) };
+        Some(View::Persistent {
+            _section: slice.section.clone(),
+            ptr,
+            len,
+        })
+    }
+
     fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: the view holds `len` committed read-write bytes, ours
-        // alone while `self` lives (other views of the slices only alias
-        // them, as the console's do).
-        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+        let (ptr, len) = match self {
+            View::Temporary { at, len } => (at.Value.cast::<u8>(), *len),
+            View::Persistent { ptr, len, .. } => (*ptr, *len),
+        };
+        // SAFETY: the view holds `len` committed read-write bytes, ours alone
+        // while `self` lives (other views of the slices only alias them, as
+        // the console's do). The persistent variant is the section's one
+        // mapping, shared with writes to other slices: each writes bytes of
+        // its own, exactly as they did through separate temporary views.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        // Only a temporary view is ours to take away.
+        if let View::Temporary { at, .. } = self {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(*at) };
+        }
     }
 }
 
@@ -569,16 +791,23 @@ fn page_runs(physical: &Physical, pages: &[usize]) -> Option<Vec<(Slice, usize)>
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
-/// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
+/// One view per run of consecutive pages, not one per page; with
+/// `VICTORY_XMEM_PERSISTENT_VIEW` a run costs no view at all, and without
+/// it each view is a map, a commit and an unmap (which flushes every core's
+/// TLB). False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    write_physical_with(Mapping::Default, pages, offset, data)
+}
+
+/// [`write_physical`] through the views `mapping` names, so tests reach
+/// either path without the environment.
+fn write_physical_with(mapping: Mapping, pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut view) = mapping.view(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
@@ -610,12 +839,23 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    page_window_with(Mapping::Default, pages, offset, len)
+}
+
+/// [`page_window`] through the views `mapping` names, so tests reach either
+/// path without the environment.
+fn page_window_with(
+    mapping: Mapping,
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> Option<PageWindow> {
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: mapping.view(slice, *n)?,
         within: offset % PAGE,
         len,
     })
@@ -1472,10 +1712,18 @@ mod tests {
         pages
     }
 
+    /// What a page number is: its section and index in it.
+    fn slice_of(page: usize) -> Slice {
+        physical().pages.get(&page).cloned().expect("known page")
+    }
+
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
-        let slice = physical().pages.get(&page).cloned().expect("known page");
-        View::map(&slice, 1).expect("mapped").bytes().to_vec()
+        Mapping::Default
+            .view(&slice_of(page), 1)
+            .expect("mapped")
+            .bytes()
+            .to_vec()
     }
 
     #[test]
@@ -1546,5 +1794,155 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// The switch is off unless the environment says yes, so a run that sets
+    /// nothing keeps the view per write — which makes every test above the
+    /// negative control for the persistent path.
+    ///
+    /// Mutation run 2026-11-25: returning `true` for `None` or for `"0"`
+    /// fails this test and nothing else.
+    #[test]
+    fn parse_persistent_views_accepts_only_an_explicit_yes() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::windows::ffi::OsStringExt;
+        for yes in ["1", "true", "TRUE", "on", "On", " yes "] {
+            assert!(parse_persistent_views(Some(OsStr::new(yes))), "{yes:?}");
+        }
+        for no in ["", " ", "0", "false", "no", "off", "2", "yes!", "on!"] {
+            assert!(!parse_persistent_views(Some(OsStr::new(no))), "{no:?}");
+        }
+        // Unset is off: the rollout default.
+        assert!(!parse_persistent_views(None));
+        // Not text at all (a lone surrogate is not UTF-16): off, never a
+        // guess, which is the direction that keeps a run on the proven path.
+        let lone_surrogate = OsString::from_wide(&[0xd800]);
+        assert!(!parse_persistent_views(Some(lone_surrogate.as_os_str())));
+    }
+
+    /// A write through the section's one persistent view lands in its pages,
+    /// commits each page once, and unmaps nothing when it finishes.
+    ///
+    /// Mutation runs 2026-11-25, both restored: (a) `mark_committed` made a
+    /// no-op fails the `committed_all` assertions below, and nothing else;
+    /// (b) the `commit` call removed makes the write fault, which is what
+    /// proves the commit is load-bearing rather than decorative.
+    #[test]
+    fn persistent_views_write_and_commit_once() {
+        let pages = allocate(3);
+        let section = slice_of(pages[0]).section.clone();
+        // Nothing is mapped whole, and no page committed through it, until a
+        // write on the persistent path asks.
+        assert!(section.persistent.get().is_none());
+        assert!(!section.committed_all(0, 3));
+
+        // Two pages from the second half of the first.
+        let data: Vec<u8> = (0..PAGE + 8).map(|i| (i * 11 % 251) as u8).collect();
+        let offset = PAGE - 8;
+        assert!(write_physical_with(Mapping::Persistent, &pages, offset, &data));
+
+        // The persistent path ran, not its fallback: only it maps the
+        // section whole and commits through that mapping.
+        assert!(
+            section.persistent.get().is_some_and(Option::is_some),
+            "the section was not mapped whole, so the write fell back to a temporary view"
+        );
+        let base = section.persistent_ptr().expect("mapped whole");
+        assert!(section.committed_all(0, 2), "both written pages committed");
+        assert!(!section.committed_all(2, 1), "the unwritten page did not");
+
+        // The bytes are in the section's pages, read through a view of our
+        // own: the same bytes a temporary view would have written.
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen[offset..offset + data.len()], data[..]);
+        assert!(seen[..offset].iter().all(|&b| b == 0), "before the write");
+        assert!(
+            seen[offset + data.len()..].iter().all(|&b| b == 0),
+            "after the write"
+        );
+
+        // A second write to the same pages commits nothing again and leaves
+        // the section's mapping the one it mapped first; a view that
+        // unmapped it here would fault on the write above instead.
+        assert!(write_physical_with(Mapping::Persistent, &pages, offset, &data));
+        assert_eq!(section.persistent_ptr(), Some(base), "the first mapping");
+        assert!(section.committed_all(0, 2));
+
+        // Unmapped pages and a bad offset are still refused on this path.
+        assert!(!write_physical_with(Mapping::Persistent, &[pages[0], 0x10], 0, &data[..PAGE + 1]));
+        assert!(!write_physical_with(Mapping::Persistent, &pages, usize::MAX, &data[..2]));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A window on the persistent view decodes in place as a temporary one
+    /// does, and leaves the section's mapping in place when it drops: the
+    /// next window is the same memory, still holding the last one's bytes.
+    #[test]
+    fn persistent_page_windows_share_one_mapping() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        {
+            // Bytes [3, PAGE + 3): the third of the second page on.
+            let mut window =
+                page_window_with(Mapping::Persistent, &pages, 3, PAGE).expect("one run");
+            assert_eq!(window.bytes().len(), PAGE);
+            window.bytes().fill(0xa5);
+        }
+        let base = section.persistent_ptr().expect("mapped whole");
+
+        // The window dropped, and nothing unmapped: the next window is the
+        // same map, and it shows what the first wrote.
+        let mut window = page_window_with(Mapping::Persistent, &pages, 0, 4).expect("one run");
+        assert_eq!(&window.bytes()[..4], &[0, 0, 0, 0xa5], "the first window's bytes");
+        window.bytes()[0] = 0x11;
+        drop(window);
+        assert_eq!(section.persistent_ptr(), Some(base), "the first mapping");
+        assert_eq!(page_bytes(pages[0])[0], 0x11, "the byte just written");
+        let first = page_bytes(pages[0]);
+        assert!(first[1..3].iter().all(|&b| b == 0));
+        assert!(first[3..].iter().all(|&b| b == 0xa5));
+        let second = page_bytes(pages[1]);
+        assert_eq!(&second[..3], &[0xa5, 0xa5, 0xa5]);
+        assert!(second[3..].iter().all(|&b| b == 0));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The temporary path is what every run before this one used, and it
+    /// stays exactly that: writes land, and the section is never mapped
+    /// whole and never committed through that mapping.
+    #[test]
+    fn temporary_views_never_map_the_section_whole() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        let data: Vec<u8> = (0..2 * PAGE).map(|i| (i % 253) as u8).collect();
+        assert!(write_physical_with(Mapping::Temporary, &pages, 0, &data));
+        assert!(
+            section.persistent.get().is_none(),
+            "the temporary path mapped the section whole"
+        );
+        assert!(!section.committed_all(0, 2), "it committed through that map");
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen, data);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The commit guard refuses a range that leaves the section and counts
+    /// that overflow, which `runs` never produces but arithmetic can.
+    #[test]
+    fn ensure_committed_refuses_ranges_outside_the_section() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        let base = section.persistent_ptr().expect("mapped whole");
+        assert!(section.ensure_committed(base, 0, 2));
+        assert!(section.committed_all(0, 2));
+        // All committed: the second call makes none, and says so.
+        assert!(section.ensure_committed(base, 0, 2));
+        // Past the section, and the two ways adding can overflow.
+        assert!(!section.ensure_committed(base, 2, 1));
+        assert!(!section.ensure_committed(base, 0, 3));
+        assert!(!section.ensure_committed(base, usize::MAX, 1));
+        assert!(!section.ensure_committed(base, 0, usize::MAX));
+        assert!(!section.ensure_committed(base, usize::MAX / 2, usize::MAX / 2));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
