@@ -24,6 +24,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+mod puddle;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1821,7 +1824,10 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            {
+                self.observe_puddle(list, "mesh");
+                dropped(self.pipeline);
+            }
         }
     }
 
@@ -2149,7 +2155,10 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            {
+                self.observe_puddle(list, "draw");
+                dropped(self.pipeline);
+            }
         }
     }
 
@@ -2250,7 +2259,10 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            {
+                self.observe_puddle(list, "indexed");
+                dropped(self.pipeline);
+            }
         }
     }
 }
@@ -2288,7 +2300,12 @@ impl State {
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                if matches!(kind, DRAW | INDEXED | MESH) {
+                    self.observe_puddle(list, "indirect");
+                }
+                crate::pipeline::note_drop(self.pipeline as This);
+            }
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256

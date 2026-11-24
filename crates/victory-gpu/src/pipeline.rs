@@ -367,6 +367,16 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn puddle_shader(this: This) -> Option<(usize, &'static str)> {
+    const SHADERS: [&str; 2] = ["7d0f14ce44746d7e", "6b6db9f1a526daeb"];
+    if this.is_null() {
+        return None;
+    }
+    let pixel = pipeline(this).shaders.iter().find(|s| s.stage == "pixel")?;
+    SHADERS.into_iter().enumerate().find(|&(_, hash)| hash == pixel.hash)
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
