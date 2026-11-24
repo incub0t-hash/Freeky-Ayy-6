@@ -1217,6 +1217,60 @@ mod tests {
     }
 
     #[test]
+    fn raw_disk_reads_publish_through_a_cpu_guard_fault() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS,
+        };
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_READONLY, PAGE_READWRITE,
+        };
+        static GUARDED: AtomicUsize = AtomicUsize::new(0);
+        static FAULTS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: Windows supplies this exception record while calling us.
+            let record = unsafe { &*(*info).ExceptionRecord };
+            let base = GUARDED.load(Ordering::Acquire);
+            if record.ExceptionCode != 0xc0000005u32 as i32 || record.NumberParameters < 2 ||
+                record.ExceptionInformation[0] != 1 || base == 0 ||
+                !(base..base + 4096).contains(&record.ExceptionInformation[1]) {
+                return 0;
+            }
+            let mut previous = 0;
+            // SAFETY: our live test allocation, opened for the faulting store.
+            if unsafe { VirtualProtect(base as _, 4096, PAGE_READWRITE, &mut previous) } == 0 {
+                return 0;
+            }
+            FAULTS.fetch_add(1, Ordering::Relaxed);
+            -1
+        }
+        let (_dir, file) = file_with(b"guarded raw read");
+        // A kernel write cannot invoke the guard callback, while a CPU store can.
+        // SAFETY: allocate a private page and register our range-specific handler.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
+        assert!(!page.is_null());
+        GUARDED.store(page as usize, Ordering::Release);
+        FAULTS.store(0, Ordering::Relaxed);
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(fault)) };
+        assert!(!handler.is_null());
+        let r = request(0, page, 16, file, 0, 16);
+        let result = execute(&r);
+        // SAFETY: the page remains readable until it is freed below.
+        let landed = unsafe { std::slice::from_raw_parts(page.cast::<u8>(), 16) }.to_vec();
+        let faults = FAULTS.load(Ordering::Relaxed);
+        GUARDED.store(0, Ordering::Release);
+        // SAFETY: remove our handler and release the allocation we created.
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(page, 0, MEM_RELEASE);
+        }
+        assert_eq!(result, Ok(()));
+        assert_eq!(landed, b"guarded raw read");
+        assert_eq!(faults, 1);
+    }
+
+    #[test]
     fn a_short_raw_file_read_does_not_publish_partial_destination_bytes() {
         let (_dir, file) = file_with(b"partial");
         let mut destination = [0xa5; 16];
