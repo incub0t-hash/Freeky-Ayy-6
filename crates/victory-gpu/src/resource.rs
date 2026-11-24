@@ -1184,6 +1184,17 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Owns a guest resource while an address-based lookup is in use.
+#[cfg(windows)]
+pub(crate) struct TargetRef(pub(crate) This);
+
+#[cfg(windows)]
+impl Drop for TargetRef {
+    fn drop(&mut self) {
+        resource_release(self.0);
+    }
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1205,7 +1216,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<TargetRef> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1242,7 +1253,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    (same && object::try_add_ref(other)).then(|| TargetRef(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1280,6 +1291,7 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
+        && !(r.host.placed.load(std::sync::atomic::Ordering::Relaxed) && r.desc.flags & 4 != 0)
         && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
@@ -1763,9 +1775,10 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    only_if_vacant: bool,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, only_if_vacant);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1791,10 +1804,12 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let address = resource.data() as u64;
+            if only_if_vacant && targets.contains_key(&address) {
+                return E_INVALIDARG;
+            }
+            targets.insert(address, at);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -1902,6 +1917,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2014,6 +2030,7 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2075,18 +2092,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
-/// The resource for an unordered access view of a texture placed at
-/// `address` with resource description `desc` and view format `view_format`
-/// (0: the resource's own): an existing unordered-access texture at that
-/// address when its format allows the view, else a placed unordered-access
-/// resource made on first use (starting in `UNORDERED_ACCESS` and recorded
-/// in [`TARGETS_AT`] so shader views placed at `address` find its texels
-/// through [`alias_of`]).
+/// Resolves a checked placed UAV to a live target. A matching target keeps
+/// its storage. A new backing can occupy a vacant address only.
 #[cfg(windows)]
-pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
-    const DEPTH: u32 = 0x2;
-    const UNORDERED: u32 = 0x4;
-    const UNORDERED_ACCESS: u32 = 0x8;
+pub(crate) fn uav_texture_at(
+    address: u64,
+    desc: &[u32; 14],
+    words: &[u32; 16],
+) -> Option<TargetRef> {
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT};
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
         cpu_pages: 0,
@@ -2094,55 +2108,123 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         creation_nodes: 1,
         visible_nodes: 1,
     };
-    if address == 0 {
-        return None;
-    }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+    let mip = words[2];
+    let layers = u32::from(d.depth_or_array_size);
+    let levels = u32::from(d.mip_levels);
+    if address == 0
+        || d.flags & 2 != 0
+        || d.sample_count != 1
+        || d.sample_quality != 0
+        || d.width == 0
+        || d.height == 0
+        || layers == 0
+        || mip >= levels
+        || levels > 15
+    {
+        return None;
+    }
+    let slice_range = |extent: u32| {
+        let (first, count) = (words[3], words[4]);
+        first < extent && count > 0 && (count == u32::MAX || count <= extent - first)
+    };
+    let shape = match (d.dimension, words[1]) {
+        (2, 2) => d.height == 1 && layers == 1,
+        (2, 3) => d.height == 1 && slice_range(layers),
+        (3, 4) => layers == 1 && words[3] == 0,
+        (3, 5) => words[5] == 0 && slice_range(layers),
+        (4, 8) => slice_range((layers >> mip).max(1)),
+        _ => false,
+    };
+    let limit = if d.dimension == 4 { 2048 } else { 16384 };
+    let spatial = d.width.max(u64::from(d.height)).max(if d.dimension == 4 {
+        u64::from(layers)
+    } else {
+        1
+    });
+    if !shape || spatial > limit || layers > 2048 || levels > spatial.ilog2() + 1 {
         return None;
     }
     let own = pc_format(d.format);
-    let wanted = if view_format == 0 {
-        own
-    } else {
-        pc_format(view_format)
+    let wanted = pc_format(if words[0] == 0 { own } else { words[0] });
+    let typeless = |f| family(f) == f && family(f + 1) == f;
+    let permits = |f| f == wanted || (typeless(f) && family(wanted) == f);
+    // The packed RGB9E5 writer uses an R32_UINT store. Other families
+    // must describe the same typed format or explicitly type a typeless resource.
+    if element(wanted).is_none_or(|(_, block)| block != 1)
+        || typeless(wanted)
+        || !(permits(own) || (own == 67 && wanted == 42))
+    {
+        return None;
+    }
+    static SUPPORT: [std::sync::OnceLock<Option<D3D12_FEATURE_DATA_FORMAT_SUPPORT>>; 116] =
+        [const { std::sync::OnceLock::new() }; 116];
+    let device = &crate::host::host()?.device;
+    let supported = SUPPORT
+        .get(wanted as usize)?
+        .get_or_init(|| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(wanted as i32),
+                ..Default::default()
+            };
+            // SAFETY: read-only format capabilities for the actual adapter.
+            unsafe {
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
+                    )
+                    .ok()?
+            };
+            Some(data)
+        })
+        .as_ref()?;
+    let dimension = match d.dimension {
+        2 => D3D12_FORMAT_SUPPORT1_TEXTURE1D,
+        3 => D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+        _ => D3D12_FORMAT_SUPPORT1_TEXTURE3D,
     };
+    let need = dimension.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    if supported.Support1.0 & need != need
+        || supported.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0
+    {
+        return None;
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&other) = targets.get(&address) {
-            let o = resource(other as This);
-            let o_fmt = target_format(pc_format(o.desc.format));
-            let w_fmt = target_format(wanted);
-            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
-            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
-            let compatible = o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
-            if o.desc.dimension == d.dimension
-                && o.desc.width == d.width
-                && o.desc.height == d.height
-                && o.desc.mip_levels == d.mip_levels
-                && o.desc.depth_or_array_size == d.depth_or_array_size
-                && o.desc.sample_count <= 1
-                && d.sample_count <= 1
-                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
-                && compatible
+            let other = other as This;
+            let o = &resource(other).desc;
+            if o.dimension != d.dimension
+                || o.width != d.width
+                || o.height != d.height
+                || o.mip_levels != d.mip_levels
+                || o.depth_or_array_size != d.depth_or_array_size
+                || o.sample_count != 1
+                || o.sample_quality != 0
+                || o.flags & 6 != 4
+                || o.layout != d.layout
+                || !permits(target_format(pc_format(o.format)))
+                || !object::try_add_ref(other)
             {
-                return Some(other as This);
+                return None;
             }
+            return Some(TargetRef(other));
         }
     }
     let mut r = *desc;
-    r[12] = (r[12] & !DEPTH) | UNORDERED;
-    if view_format != 0 && target_format(own) != target_format(wanted) {
-        if family(own) == family(wanted) {
-            r[8] = family(wanted);
-        } else if element(own) == element(wanted) {
-            r[8] = wanted;
-        }
+    r[12] |= 4;
+    // Allocate a concrete UAV of the packed writer's format. Explicitly
+    // typeless allocations keep their format for other views in the same family.
+    if own == 67 && wanted == 42 {
+        r[8] = wanted;
     }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&existing) = map.get(&(address, r)) {
-        return Some(existing as This);
+    if map.contains_key(&(address, r)) {
+        // A different registered target displaced this old synthetic object.
+        return None;
     }
     // SAFETY: 56 bytes in the description's layout.
     let uav_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -2152,10 +2234,11 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         DEFAULT,
         0,
         Backing::Address(address as *mut u8),
-        UNORDERED_ACCESS,
+        0x8,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
+        true,
     );
     if made != S_OK {
         return None;
@@ -2165,7 +2248,8 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         .host
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    Some(out)
+    object::add_ref(out);
+    Some(TargetRef(out))
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2213,6 +2297,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        false,
     )
 }
 

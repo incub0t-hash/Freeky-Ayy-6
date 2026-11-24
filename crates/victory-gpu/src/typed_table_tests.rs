@@ -80,8 +80,7 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
     assert_eq!(mask(&state, second), 1);
     assert_eq!(mask(&state, first), 2);
 
-    // A placed texture UAV that the runtime cannot currently construct has
-    // no integer flag even when its resource description says R32_UINT.
+    // A compatible placed texture UAV reuses the named integer target.
     let mut placed = [0u32; 16];
     placed[0] = 42;
     placed[1] = 4;
@@ -90,7 +89,7 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
     guest.0[8] = 42;
     descriptor::create_placed_uav(null, &guest.0, &placed, root + 96);
     let third = bind(&mut state)[0].1;
-    assert_eq!(mask(&state, third), 1);
+    assert_eq!(mask(&state, third), 3);
     assert_eq!(state.typed_table_flags(&used, 3, first, 0), 2);
     assert_eq!(state.typed_table_flags(&used, 3, second, 0), 1);
     // Two heap objects are allowed to cover the very same guest descriptor
@@ -112,7 +111,7 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
         aliased, third,
         "the second host heap must allocate its own table"
     );
-    assert_eq!(state.typed_table_flags(&used, 3, aliased, 0), 1);
+    assert_eq!(state.typed_table_flags(&used, 3, aliased, 0), 3);
     state.set_heaps(&[heap]);
     assert_eq!(bind(&mut state), [(3, third)]);
     // The recording still uses the exact first heap after the title drops it.

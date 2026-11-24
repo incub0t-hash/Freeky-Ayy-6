@@ -863,7 +863,22 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(true, resource, desc));
+        let placed = View::Placed(true, resource, desc);
+        // Name the concrete target in the descriptor's generation. Releasing
+        // a guest resource retires this descriptor just like a regular UAV.
+        #[cfg(windows)]
+        if resource[0] != 1 {
+            if let Some((view, _lease)) = host::placed_texture(&placed) {
+                record(handle, view);
+            } else {
+                // Bind a null UAV of the declared dimension even if the
+                // same address later acquires a different target.
+                let words = desc[..10].try_into().ok();
+                record(handle, View::Unordered(0, 0, words));
+            }
+            return;
+        }
+        record(handle, placed);
     }
 }
 
