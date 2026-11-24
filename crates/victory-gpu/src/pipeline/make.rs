@@ -298,6 +298,10 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(feature = "diagnostics")]
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(workers).clamp(1, workers);
+        tracing::info!(workers, "host pipeline compiler workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
