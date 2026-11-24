@@ -844,8 +844,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let ready = self.prepare(list, false);
+        let rects = ready && self.topology == RECTANGLES &&
+            !crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangle_stage);
+        let ran = ready && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -997,7 +999,7 @@ impl State {
             why("pipeline kind does not match the command signature");
             return false;
         }
-        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+        if self.topology == RECTANGLES && (kind == INDEXED || (kind == DRAW && !p.rectangle_stage)) {
             why("rectangle-list indirect draws need vertex expansion");
             return false;
         }

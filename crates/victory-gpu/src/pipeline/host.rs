@@ -17,6 +17,9 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+#[path = "rectangle.rs"]
+mod rectangle;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -275,6 +278,8 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// A geometry shader completes rectangles placed by vertex number.
+    pub(crate) rectangle_stage: bool,
 }
 
 /// Reads the required wave-lane range `(min, max)` from an emitted DXIL
@@ -555,6 +560,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                rectangle_stage: false,
                 pso,
                 root,
                 stages: bound,
@@ -587,6 +593,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                rectangle_stage: false,
                 pso,
                 root,
                 stages: bound,
@@ -596,10 +603,26 @@ impl HostPipeline {
             });
         }
 
+        let vs = code_bytes(&code(0));
+        let ps = code_bytes(&code(1));
+        let gs = if g.topology.0 == RECTANGLES && g.elements().iter().all(|e| e.per_instance) {
+            let Some(stage) = rectangle::rect_gs(&vs, &ps) else {
+                return refuse("no compatible vertex-number rectangle geometry stage", shaders);
+            };
+            Some(stage)
+        } else {
+            None
+        };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
+            GS: gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |bytes| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                }
+            }),
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
@@ -622,12 +645,10 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
+        let name = match &gs {
+            Some(stage) => super::library::name("graphics", &root_blob, &[&vs, &ps, stage], &state),
+            None => super::library::name("graphics", &root_blob, &[&vs, &ps], &state),
+        };
         let made = super::library::pipeline(
             &name,
             // SAFETY: the description points at live data.
@@ -657,6 +678,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            rectangle_stage: gs.is_some(),
             pso,
             root,
             stages: bound,
