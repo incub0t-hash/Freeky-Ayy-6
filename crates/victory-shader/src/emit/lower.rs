@@ -221,6 +221,7 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    heap_raw_loads: std::collections::BTreeSet<Site>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -1043,6 +1044,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            heap_raw_loads: super::scalar_srvs::heap_raw_loads(x.native, x.p, x.res),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -3739,7 +3741,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        if self.heap_raw_loads.contains(&site) || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);

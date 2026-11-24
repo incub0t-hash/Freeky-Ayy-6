@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH3";
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -221,6 +221,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
     for slots in [&s.root_cbvs, &s.root_srvs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, s.scalar_raw_srvs.len() as u32);
+    for &(slot, offset) in &s.scalar_raw_srvs {
+        word(&mut out, u32::from(slot));
+        word(&mut out, offset);
     }
     // The dispatch precondition travels with its DXIL and root mapping.
     // A torn or damaged entry must never lose just the precondition.
@@ -308,10 +313,20 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let n = r.word()? as usize;
+    let mut scalar_raw_srvs = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let entry = (u8::try_from(r.word()?).ok()?, r.word()?);
+        if stage != HwStage::Cs || entry.1 % 8 != 0 || scalar_raw_srvs.last().is_some_and(|last| *last >= entry) {
+            return None;
+        }
+        scalar_raw_srvs.push(entry);
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         mesh_wave32_compatible,
         record_stride,
+        scalar_raw_srvs,
         dxil,
         user_data,
         samplers,
@@ -330,6 +345,7 @@ mod tests {
             stage: HwStage::Ps,
             mesh_wave32_compatible: false,
             record_stride: None,
+            scalar_raw_srvs: Vec::new(),
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -426,6 +442,7 @@ mod tests {
         assert_eq!(decode(&encode(&invalid)), None);
         let mut guarded = shader();
         guarded.stage = HwStage::Cs;
+        guarded.scalar_raw_srvs = vec![(0, 0), (0, 8)];
         guarded.user_data[0].root = RootType::Constants;
         guarded.record_stride = Some(guarded.user_data[0]);
         let encoded = encode(&guarded);
