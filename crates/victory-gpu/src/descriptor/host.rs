@@ -1763,11 +1763,12 @@ impl HostHeap {
 
     pub(crate) fn image_size(&self, index: u32, key: u64, guest: &View) -> Option<u32> {
         let made = self.made.try_lock().ok()?;
-        if key == 0 || *made.get(index as usize)? != key {
+        let host = made.host(index)? as usize;
+        if key == 0 || *made.keys.get(host)? != key {
             return None;
         }
         let kept = self.kept.try_lock().ok()?;
-        let resource = kept.get(index as usize)?.as_ref()?;
+        let resource = kept.get(host)?.as_ref()?;
         // SAFETY: the host slot retains a live reference.
         packed_image_size(&unsafe { resource.GetDesc() }, guest)
     }
@@ -1779,9 +1780,10 @@ impl HostHeap {
         // Submission may hold the queue mutex. Never wait on a recorder that
         // is replacing a slot and retiring the previous resource.
         let made = self.made.try_lock().map_err(|_| "host mirror busy")?;
-        let key = *made.get(index as usize).ok_or("outside host heap")?;
+        let host = made.host(index).ok_or("unmapped title slot")? as usize;
+        let key = *made.keys.get(host).ok_or("outside host heap")?;
         let kept = self.kept.try_lock().map_err(|_| "host resource busy")?;
-        let desc = kept.get(index as usize).ok_or("outside host heap")?.as_ref().map(|resource| {
+        let desc = kept.get(host).ok_or("outside host heap")?.as_ref().map(|resource| {
             // SAFETY: kept owns a COM reference to this resource.
             let d = unsafe { resource.GetDesc() };
             format!("dim={} width={} height={} depth_or_layers={} mips={} format={}",
@@ -1795,7 +1797,10 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).keys.get(index as usize)?;
+        let key = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            *made.keys.get(made.host(index)? as usize)?
+        };
         if key == 0 {
             return Some("null".into());
         }
