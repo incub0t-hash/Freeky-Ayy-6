@@ -6699,7 +6699,11 @@ impl<'a> Lower<'a> {
                         // The level follows the coordinates.
                         let lod = addr_val(self, first + coords)?;
                         let lod = to_float(self, lod);
-                        if sampler.min_lod != sampler.max_lod && !self.s.m.is_integral_float(lod) {
+                        let lane_value = inst.read(Reg::V(regs[first + coords]));
+                        if sampler.min_lod != sampler.max_lod && !self.s.m.is_integral_float(lod)
+                            && !lane_value.is_some_and(|v| super::gather_lod::integral(
+                                self.x.p, self.x.st, &self.def_block, v, site, self.console_cf,
+                            )) {
                             return Err("an explicit-level gather with an unproven integral LOD");
                         }
                         let min = self.s.m.f32(sampler.min_lod.to_bits());

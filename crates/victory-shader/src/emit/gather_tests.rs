@@ -235,6 +235,32 @@ fn gather_reads_selected_mip_with_sampler_and_view_bounds() {
 }
 
 #[test]
+fn gather_accepts_rounded_lod_only_in_lanes_that_were_rounded() {
+    let sampler = Some([0x1b6, 12 << 20, 0x1850_0000, 0]);
+    let mut prefix = vec![
+        0x0608_08ff, 0.25f32.to_bits(), // v_add_f32 v4, 0.25, v4 (fractional for all)
+        0x7da8_0090, // v_cmpx_gt_u32 exec, 16, v0 (lower half)
+        0x7e08_4504, // v_ceil_f32 v4, v4
+        0x0608_08f3, // v_add_f32 v4, -1.0, v4
+        0x2008_0880, // v_max_f32 v4, 0, v4
+    ];
+    let mut active = prefix.clone();
+    active.extend_from_slice(GATHER4_L);
+    let shader = build(&active, sampler).unwrap();
+    for (device, lanes) in run(&shader, 0) {
+        for (lane, got) in lanes.into_iter().enumerate() {
+            let want = if lane < 16 { expected(lane as u32, 0, 12, 6, (0, 0)) } else { [0.0; 4] };
+            assert_eq!(got, want, "{device}, lane {lane}");
+        }
+    }
+    // Reactivating the upper lanes exposes their original fractional value.
+    prefix.push(0xbefe_03c1); // s_mov_b32 exec_lo, -1
+    prefix.extend_from_slice(GATHER4_L);
+    let reason = build(&prefix, sampler).err().expect("expected refusal");
+    assert!(reason.contains("integral LOD"), "{reason}");
+}
+
+#[test]
 fn gather_and_comparison_sample_have_distinct_sampler_bindings() {
     let mut body = GATHER4_L.to_vec();
     // image_sample_c_lz v12, v[2:4], s[12:19], s[8:11] dmask:0x1 dim:2D
