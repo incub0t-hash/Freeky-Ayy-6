@@ -506,13 +506,17 @@ type Kept = Option<ID3D12Resource>;
 pub(crate) struct ScalarWindow {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     address: u64,
-    stride: u32,
+    len: u64,
     desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
 }
 
 impl ScalarWindow {
     pub(crate) fn generation(&self) -> usize {
         std::sync::Arc::as_ptr(&self.shadow) as usize
+    }
+
+    pub(crate) fn identity(&self) -> (usize, u64, u64) {
+        (self.generation(), self.address, self.len)
     }
 
     pub(crate) fn bind(&self, list: &crate::host::HostList, heap: &HostHeap, index: u32) -> bool {
@@ -531,7 +535,7 @@ impl ScalarWindow {
     }
 
     pub(crate) fn refresh(&self, list: &crate::host::HostList) {
-        crate::shadow::refresh_named(list, &self.shadow, self.address, u64::from(self.stride));
+        crate::shadow::refresh_named(list, &self.shadow, self.address, self.len);
     }
 }
 
@@ -577,24 +581,59 @@ pub(crate) fn scalar_window(view: &View, stride: u32) -> Option<ScalarWindow> {
     if address == 0 {
         return None;
     }
-    let shadow = crate::shadow::find_named(address, width)?;
+    raw_window(address, width)
+}
+
+/// Make only the selected direct buffer view. Validate the guest allocation
+/// and its declared element window before obtaining the canonical GPU shadow.
+pub(crate) fn direct_raw_window(view: &View) -> Option<ScalarWindow> {
+    let (base, width, words): (u64, u64, &[u32; 10]) = match view {
+        View::Shader(r, Some(words)) => {
+            let (base, width) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            (base as u64, width, words)
+        }
+        View::Placed(false, resource, words) if resource[0] == 1 && resource[12] & 4 == 0 =>
+            (u64::from(words[10]) | u64::from(words[11]) << 32,
+             u64::from(resource[4]) | u64::from(resource[5]) << 32, words[..10].try_into().ok()?),
+        _ => return None,
+    };
+    if words[0] != DXGI_FORMAT_R32_TYPELESS.0 as u32 || words[1] != 1
+        || words[7] != 0 || words[8] != D3D12_BUFFER_SRV_FLAG_RAW.0 as u32
+        || base == 0 || words[2] != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
+        return None;
+    }
+    let desc = srv_desc(words);
+    // SAFETY: D3D12_SRV_DIMENSION_BUFFER was checked above.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let first = buffer.FirstElement.checked_mul(4)?;
+    let len = u64::from(buffer.NumElements) * 4;
+    if len == 0 || first.checked_add(len)? > width { return None; }
+    raw_window(base.checked_add(first)?, len)
+}
+
+fn raw_window(address: u64, len: u64) -> Option<ScalarWindow> {
+    let elements = u32::try_from(len / 4).ok()?;
+    let shadow = crate::shadow::find_named(address, len)?;
     let offset = shadow.offset(address);
     if !offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         return None;
     }
-    let mut desc = srv_desc(words[..10].try_into().ok()?);
-    desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
     desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
         FirstElement: offset / 4,
-        NumElements: stride / 4,
+        NumElements: elements,
         StructureByteStride: 0,
         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
     };
     Some(ScalarWindow {
         shadow,
         address,
-        stride,
+        len,
         desc,
     })
 }

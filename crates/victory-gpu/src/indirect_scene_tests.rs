@@ -139,6 +139,15 @@ fn shader(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
 
 #[test]
 fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() {
+    scene_raw_window(false);
+}
+
+#[test]
+fn root_selected_direct_srv_reads_cpu_and_gpu_writes_and_preserves_slot_lifetime() {
+    scene_raw_window(true);
+}
+
+fn scene_raw_window(direct: bool) {
     use super::{ResourceType, RootType, UsedResource};
     use crate::descriptor::{self, View, host::scalar_window};
     let host = host().expect("GPU required");
@@ -169,7 +178,7 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
     assert!(scalar_window(&view(base + 2000, bytes, 1), bytes).is_none());
     // A shader-visible heap with the same 8-dword table offset the culler uses.
     // Include the extended guest description's optional placement fields.
-    let extended_desc = [0u32, 8, 1, 0, 0, 0, 0, 0];
+    let extended_desc = [0u32, 32, 1, 0, 0, 0, 0, 0];
     let null = std::ptr::null();
     let mut guest_heap = null;
     assert_eq!(
@@ -186,6 +195,13 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
         unreachable!()
     };
     descriptor::create_placed_srv(null, resource, desc, guest.start + 32);
+    let mut direct_desc = *desc;
+    direct_desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    direct_desc[6] = bytes / 4;
+    direct_desc[7] = 0;
+    direct_desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+    let direct_handle = guest.start + 17 * 32;
+    descriptor::create_placed_srv(null, resource, &direct_desc, direct_handle);
     let heap = guest.host().unwrap();
     let u = UsedResource {
         kind: ResourceType::Srv,
@@ -250,14 +266,28 @@ fn scalar_scene_record_reads_gpu_and_cpu_updates_through_its_exact_raw_window() 
             let mut state = super::State::default();
             state.set_heaps(&[guest_heap]);
             state.set_table(true, 0, guest.start);
-            if pass == 0 {
-                assert!(state.tables(&list, &[u], true, &[]).is_empty());
-            }
-            let made = state.tables(&list, &[u], true, &[(0, 8)]);
-            assert_eq!(made.len(), 1);
-            assert_eq!(made[0].0, 0);
-            assert_eq!(state.tables(&list, &[u], true, &[(0, 8)]), made);
-            let slot = made[0].1 / 32 + 1;
+            let slot = if direct {
+                let slot = state.direct_raw_view(&list, Some(17)).unwrap();
+                assert_eq!(state.direct_raw_view(&list, Some(17)), Some(slot));
+                let empty = state.direct_raw_view(&list, Some(32)).unwrap();
+                assert_eq!(state.direct_raw_view(&list, None), Some(empty));
+                assert_ne!(slot, empty);
+                // Recycle the selected guest slot before submission. The
+                // recorded command's private alias must retain the old view.
+                let mut moved = direct_desc;
+                moved[10] = moved[10].wrapping_add(16);
+                descriptor::create_placed_srv(null, resource, &moved, direct_handle);
+                assert_ne!(state.direct_raw_view(&list, Some(17)), Some(slot));
+                descriptor::create_placed_srv(null, resource, &direct_desc, direct_handle);
+                slot
+            } else {
+                if pass == 0 { assert!(state.tables(&list, &[u], true, &[]).is_empty()); }
+                let made = state.tables(&list, &[u], true, &[(0, 8)]);
+                assert_eq!(made.len(), 1);
+                assert_eq!(made[0].0, 0);
+                assert_eq!(state.tables(&list, &[u], true, &[(0, 8)]), made);
+                made[0].1 / 32 + 1
+            };
             list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
             list.list.SetComputeRootSignature(&read_root);
             list.list.SetPipelineState(&read);

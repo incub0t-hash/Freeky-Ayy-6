@@ -621,6 +621,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         mesh_wave32_compatible: false,
         record_stride: None,
         scalar_raw_srvs: Vec::new(),
+        direct_raw_indices: Vec::new(),
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {

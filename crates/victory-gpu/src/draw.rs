@@ -91,6 +91,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Raw SRVs owned by this list, keyed by view heap, shadow generation and byte window.
+    direct_raw_views: std::collections::HashMap<(usize, Option<(usize, u64, u64)>), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -507,12 +509,18 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if compute && t.host.direct_raw_indices.contains(&u.index) => {
+                            let Some(index) = self.direct_raw_view(list, self.compute_constant(u.slot, u.dword)) else {
+                                return false;
+                            };
+                            index
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
                 #[cfg(feature = "diagnostics")]
                 if compute {
-                    self.trace_compute_bindings(&stage.shader.hash, &t.used, &made, &values);
+                    self.trace_compute_bindings(&stage.shader.hash, &t.used, &made, &values, &t.host);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -681,7 +689,7 @@ impl State {
     /// Report the actual root values, remapped heap slot and retained resource for
     /// a few dispatches of each compute stage selected for invocation capture.
     #[cfg(feature = "diagnostics")]
-    fn trace_compute_bindings(&self, hash: &str, used: &[UsedResource], made: &[(u8, u32)], values: &[u32]) {
+    fn trace_compute_bindings(&self, hash: &str, used: &[UsedResource], made: &[(u8, u32)], values: &[u32], shader: &victory_shader::emit::HostShader) {
         use std::{collections::HashMap, sync::{Mutex, OnceLock}};
         if !crate::capture::stage_query::watched().iter().any(|wanted| wanted == hash) { return; }
         static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -693,6 +701,18 @@ impl State {
             *n
         };
         tracing::info!(hash, recording, ?values, "sampled compute root dwords");
+        for u in shader.user_data.iter().filter(|u| shader.direct_raw_indices.contains(&u.index)) {
+            let selected = self.compute_constant(u.slot, u.dword);
+            let Some(&alias) = values.get(u.index as usize) else { continue };
+            let Some((&(_, window), _)) = self.direct_raw_views.iter()
+                .find(|((h,_), v)| *h == self.heaps[0] && **v == alias) else {continue};
+            let range = window.map(|(_,a,n)|(a,n));
+            let gpu = crate::descriptor::heap(self.heaps[0] as This).host()
+                .and_then(|h| h.retained_resource(alias)).flatten()
+                .and_then(|r| range.and_then(|(a,n)| crate::shadow::bound_range(&r,a,n))).map(|x| x.1);
+            tracing::info!(hash, recording, user_data=u.index, ?selected, alias, ?range, ?gpu,
+                "sampled private direct heap buffer");
+        }
         for &heap in self.heaps.iter().filter(|&&heap| heap != 0) {
             crate::descriptor::heap(heap as This).trace_direct_views(hash, recording);
         }
@@ -721,6 +741,32 @@ impl State {
                 guest_buffer = ?shadow.map(|pair| pair.0), gpu = ?shadow.map(|pair| pair.1), ?view,
                 "sampled compute table descriptor");
         }
+    }
+
+    fn direct_raw_view(&mut self, list: &HostList, selected: Option<u32>) -> Option<u32> {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 { return None; }
+        let heap = crate::descriptor::heap(heap_id as This);
+        let host = heap.host()?;
+        let window = selected.and_then(|value| {
+            // The native shader shifts a 32-bit index left by five, then
+            // addresses a 32-byte view at the resulting byte offset.
+            let index = value & (u32::MAX >> 5);
+            let at = heap.start.checked_add(32 * u64::from(index))?;
+            if heap.index(at) != Some(index) { return None; }
+            crate::descriptor::view(at).as_ref().and_then(crate::descriptor::host::direct_raw_window)
+        });
+        let key = (heap_id, window.as_ref().map(|w| w.identity()));
+        if let Some(&slot) = self.direct_raw_views.get(&key) {
+            return Some(slot);
+        }
+        let slot = host.dynamic(1)?;
+        if !window.as_ref().is_some_and(|w| w.bind(list, host, slot)) {
+            host.null_scalar_buffer(slot);
+        }
+        self.dynamic.push((heap_id, slot, 1));
+        self.direct_raw_views.insert(key, slot);
+        Some(slot)
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
