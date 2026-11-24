@@ -701,14 +701,17 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 { return true; }
+    if to % PAGE != 0 || from % PAGE != 0 { return false; }
     let Some(mapped_len) = len.div_ceil(PAGE).checked_mul(PAGE) else { return false; };
     let Some(end) = to.checked_add(mapped_len) else { return false; };
+    if from.checked_add(mapped_len).is_none() { return false; }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let (first, size) = changing_views(&physical, to, end);
     let _changing = victory_gpu::title_memory_remapping_range(first, size);
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
+    unmap(&mut physical, to, mapped_len);
+    for k in (0..mapped_len).step_by(PAGE) {
         if from == 0 {
             break;
         }
