@@ -1132,6 +1132,15 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Resolve the byte range in the resource named by the command. A different
+/// placed buffer may immediately follow it in the title's address space.
+fn indirect_address((base, size): (*mut u8, u64), offset: u64, bytes: u64) -> Option<u64> {
+    if !offset.is_multiple_of(4) || offset.checked_add(bytes)? > size {
+        return None;
+    }
+    (base as u64).checked_add(offset)
+}
+
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
@@ -1158,12 +1167,18 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    if max == 0 {
+        return;
+    }
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let required = u64::from(stride) * u64::from(max);
+    let address = crate::resource::buffer_bytes(arguments)
+        .and_then(|buffer| indirect_address(buffer, offset, required));
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|buffer| indirect_address(buffer, count_offset, 4));
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1404,6 +1419,17 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn indirect_ranges_must_fit_the_named_buffer() {
+        let buffer = (0x1000 as *mut u8, 64);
+        assert_eq!(indirect_address(buffer, 4, 60), Some(0x1004));
+        assert_eq!(indirect_address(buffer, 64, 0), Some(0x1040));
+        assert_eq!(indirect_address(buffer, 4, 64), None);
+        assert_eq!(indirect_address(buffer, 64, 4), None);
+        assert_eq!(indirect_address(buffer, 2, 4), None);
+        assert_eq!(indirect_address(buffer, u64::MAX - 3, 4), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

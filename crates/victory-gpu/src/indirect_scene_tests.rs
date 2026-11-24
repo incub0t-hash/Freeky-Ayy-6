@@ -35,12 +35,14 @@ fn read_clamped(list: &HostList, kind: u32, batches: &[&[[u32; 4]]]) -> Vec<[u32
                 list,
                 &args,
                 args.GetGPUVirtualAddress() + offset,
-                (kind, 16, batch.len() as u32)
+                (kind, 16, batch.len() as u32),
+                None,
             ));
-            crate::indirect::done(list, &args);
+            crate::indirect::done(list, &args, None);
             offset += std::mem::size_of_val(*batch) as u64;
         }
         list.close();
+        assert_eq!(host.log_messages(), None, "clamp recording validation");
         host.execute(&[list]);
         host.device.GetDeviceRemovedReason().unwrap();
         assert_eq!(mapped.cast::<u64>().read_volatile(), header);
@@ -137,20 +139,60 @@ fn shader(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
 
 #[test]
 fn gpu_generated_draws_reach_depth_tested_framebuffer() {
+    indirect_framebuffer(None);
+}
+
+#[test]
+fn gpu_generated_count_selects_draws_in_separate_or_shared_buffer() {
+    indirect_framebuffer(Some(CountLocation::Separate));
+    indirect_framebuffer(Some(CountLocation::ArgumentBuffer));
+}
+
+#[derive(Clone, Copy)]
+enum CountLocation {
+    Separate,
+    ArgumentBuffer,
+}
+
+fn indirect_framebuffer(location: Option<CountLocation>) {
     let host = host().expect("GPU required");
     let dev = &host.device;
+    // Record which device actually rendered the fixture.
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    use windows::core::Interface;
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).unwrap();
+        let desc = adapter.GetDesc1().unwrap();
+        let end = desc
+            .Description
+            .iter()
+            .position(|u| *u == 0)
+            .unwrap_or(desc.Description.len());
+        eprintln!(
+            "D3D12 framebuffer adapter: {}; debug queue available: {}",
+            String::from_utf16_lossy(&desc.Description[..end]),
+            dev.cast::<ID3D12InfoQueue>().is_ok()
+        );
+    }
 
     // Generate the draw arguments on the GPU.
     let cs = compile(
         r#"
         RWByteAddressBuffer args : register(u0);
-
-        [RootSignature("UAV(u0)")]
+        RWByteAddressBuffer countBuffer : register(u1);
+        cbuffer Count : register(b0) { uint countOffset; uint counted; };
+        [RootSignature("UAV(u0), UAV(u1), RootConstants(num32BitConstants=2, b0)")]
         [numthreads(4,1,1)]
         void main(uint3 id : SV_DispatchThreadID) {
             uint vertices = id.x == 3 ? 0 : 6;
+            // A disabled record beyond the optional count must stay intact.
+            uint instances = id.x == 3 && counted ? 0xffffffffu : 1;
             args.Store4(id.x * 16,
-                uint4(vertices, 1, id.x * 6, 0));
+                uint4(vertices, instances, id.x * 6, 0));
+            if (id.x == 0) countBuffer.Store(countOffset, 2);
         }
     "#,
         s!("cs_5_1"),
@@ -211,7 +253,11 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
 
     let list = host.new_list().unwrap();
 
-    let (args, args_cpu) = host.shared_buffer(64).unwrap();
+    let (args, args_cpu) = host.shared_buffer(80).unwrap();
+    let separate = matches!(location, Some(CountLocation::Separate))
+        .then(|| host.shared_buffer(16).unwrap().0);
+    let counter = separate.as_ref().unwrap_or(&args);
+    let count_offset = if separate.is_some() { 4 } else { 68 };
 
     let vb_bytes = vertices.len() * 28;
     let (vb, vb_cpu) = host.shared_buffer(vb_bytes as u64).unwrap();
@@ -385,6 +431,18 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
 
         list.list.SetComputeRootSignature(&compute_root);
         list.list.SetPipelineState(&compute);
+        if separate.is_some() {
+            list.list.ResourceBarrier(&[transition(
+                counter,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        list.list
+            .SetComputeRootUnorderedAccessView(1, counter.GetGPUVirtualAddress());
+        let constants = [count_offset as u32, u32::from(location.is_some())];
+        list.list
+            .SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
 
         list.list
             .SetComputeRootUnorderedAccessView(0, args.GetGPUVirtualAddress());
@@ -397,6 +455,7 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
             &args,
             args.GetGPUVirtualAddress(),
             (0, 16, 4),
+            location.map(|_| (counter, counter.GetGPUVirtualAddress() + count_offset)),
         ));
 
         list.list.SetGraphicsRootSignature(&graphics_root);
@@ -439,10 +498,16 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
 
         let signature = host_signature(0, 16).expect("Indirect draw signature");
 
-        list.list
-            .ExecuteIndirect(&signature, 4, &args, 0, None::<&ID3D12Resource>, 0);
+        list.list.ExecuteIndirect(
+            &signature,
+            4,
+            &args,
+            0,
+            location.map(|_| counter),
+            location.map_or(0, |_| count_offset),
+        );
 
-        crate::indirect::done(&list, &args);
+        crate::indirect::done(&list, &args, location.map(|_| counter));
 
         list.list.ResourceBarrier(&[transition(
             &color,
@@ -454,6 +519,11 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
             crate::capture::read_back(dev, &list.list, &color).expect("Framebuffer readback");
 
         list.close();
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "framebuffer recording validation"
+        );
         host.execute(&[&list]);
 
         assert!(dev.GetDeviceRemovedReason().is_ok());
@@ -462,7 +532,12 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
 
         assert_eq!(
             generated,
-            &[[6, 1, 0, 0], [6, 1, 6, 0], [6, 1, 12, 0], [0, 1, 18, 0],]
+            &[
+                [6, 1, 0, 0],
+                [6, 1, 6, 0],
+                [6, 1, 12, 0],
+                [0, location.map_or(1, |_| u32::MAX), 18, 0],
+            ]
         );
 
         let mut mapped = std::ptr::null_mut();
@@ -488,7 +563,7 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
                 let expected: [u8; 4] = if (16..48).contains(&y) && (4..28).contains(&x) {
                     red += 1;
                     [255, 0, 0, 255]
-                } else if (16..48).contains(&y) && (36..60).contains(&x) {
+                } else if location.is_none() && (16..48).contains(&y) && (36..60).contains(&x) {
                     green += 1;
                     [0, 255, 0, 255]
                 } else {
@@ -503,14 +578,26 @@ fn gpu_generated_draws_reach_depth_tested_framebuffer() {
         }
 
         // Save the actual GPU output, even if verification fails.
-        crate::capture::save(1, 64, 64, pitch, false, pixels);
+        let frame = match location {
+            None => 1,
+            Some(CountLocation::Separate) => 2,
+            Some(CountLocation::ArgumentBuffer) => 3,
+        };
+        crate::capture::save(frame, 64, 64, pitch, false, pixels);
 
         readback.Unmap(0, None);
         list.reset();
 
         assert_eq!(incorrect, 0, "Incorrect framebuffer pixels");
 
-        assert_eq!((red, green, black), (768, 768, 2560));
+        assert_eq!(
+            (red, green, black),
+            if location.is_some() {
+                (768, 0, 3328)
+            } else {
+                (768, 768, 2560)
+            }
+        );
 
         println!(
             "VERIFIED GPU SCENE: 4096 exact pixels; \

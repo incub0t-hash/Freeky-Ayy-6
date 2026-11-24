@@ -1027,9 +1027,17 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let count_view = counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)));
+        let count_buffer = count_view.map(|(buffer, _)| buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            count_view,
+        ) {
+            why("no argument clamp or unaligned indirect arguments/count");
             return false;
         }
         self.host_pipeline = 0;
@@ -1041,7 +1049,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, count_buffer);
             why("pipeline exists but its resources could not be bound");
             return false;
         }
@@ -1057,11 +1065,11 @@ impl State {
                 max,
                 &args.buffer,
                 args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
+                count_buffer,
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, count_buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

@@ -23,12 +23,13 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint firstByte; };
+#define RS "RootConstants(num32BitConstants=5, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint firstByte; uint countByte; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+RWByteAddressBuffer commandCount : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -36,6 +37,10 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
+    // The optional counter's offset inside its aligned root UAV is 0..12.
+    [branch] if (countByte < 16) {
+        if (id.x >= commandCount.Load(countByte)) return;
+    }
     uint at = firstByte + id.x * stride;
     uint cost;
     if (kind <= 1) {
@@ -144,26 +149,34 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// `buffer`. With a count buffer the clamp reads its GPU-produced count
+/// and leaves later records untouched. Both resources are then ready for
+/// ExecuteIndirect. Replaces the list's compute root signature and pipeline.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    count: Option<(&ID3D12Resource, u64)>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+    if !gpu.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || count.is_some_and(|(_, at)| !at.is_multiple_of(4))
+    {
         return false;
     }
     let l = &list.list;
     // ExecuteIndirect accepts dword offsets, but a raw root UAV has a
     // 16-byte base alignment. Keep the dword offset inside that view.
-    let first_byte = gpu % u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
-    let constants = [kind, stride, records, first_byte as u32];
+    let alignment = u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+    let first_byte = gpu % alignment;
+    let (count_base, count_byte) = count.map_or((budget, 16), |(_, at)| {
+        (at - at % alignment, (at % alignment) as u32)
+    });
+    let constants = [kind, stride, records, first_byte as u32, count_byte];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -171,9 +184,10 @@ pub(crate) fn bound(
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu - first_byte);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, count_base);
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -183,20 +197,34 @@ pub(crate) fn bound(
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
+        if let Some((counter, _)) = count.filter(|(counter, _)| *counter != buffer) {
+            l.ResourceBarrier(&[transition(
+                counter,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
     }
     true
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+/// Restore the argument and count buffers to unordered access. A count in
+/// the argument buffer shares its state transition.
+pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, count: Option<&ID3D12Resource>) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
             buffer,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
+        )]);
+        if let Some(counter) = count.filter(|counter| *counter != buffer) {
+            list.list.ResourceBarrier(&[transition(
+                counter,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
     };
 }
 
