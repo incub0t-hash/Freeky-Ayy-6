@@ -537,9 +537,31 @@ impl HostHeap {
         }
     }
 
-    fn ensure_buffer_slot(&self, index: u32, key: u64, view: &View) -> Option<ID3D12Resource> {
+    fn same_backing(
+        &self,
+        index: u32,
+        backing: &ID3D12Resource,
+    ) -> bool {
+        use windows::core::Interface;
+
+        self.kept.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|r| r.as_raw() == backing.as_raw())
+    }
+
+    fn ensure_buffer_slot(
+        &self,
+        index: u32,
+        key: u64,
+        view: &View,
+        backing: &ID3D12Resource,
+    ) -> Option<ID3D12Resource> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made[index as usize] != key {
+        if made[index as usize] != key
+            || !self.same_backing(index, backing)
+        {
             let kept = make(view, self.cpu(index));
             let res = kept.flatten();
             if res.is_none() {
@@ -623,7 +645,10 @@ impl HostHeap {
                 .is_some_and(|s| s.active);
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                if made[index as usize] != key || bounce_active {
+                if made[index as usize] != key
+                    || bounce_active
+                    || !self.same_backing(index, &shadow.buffer)
+                {
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                         BufferLocation: shadow.gpu(address),
                         SizeInBytes: aligned,
@@ -822,10 +847,20 @@ impl HostHeap {
                         self.set_unmapped_null(index, &view);
                         continue;
                     }
-                    if let Some(r) = self.ensure_buffer_slot(index, key, &view) {
-                        retained.push(r);
-                    }
                     if let Some(shadow) = crate::shadow::find(address, len) {
+                        let Some(r) = self.ensure_buffer_slot(
+                            index, key, &view, &shadow.buffer
+                        ) else {
+                            self.set_unmapped_null(index, &view);
+                            continue;
+                        };
+
+                        if r.as_raw() != shadow.buffer.as_raw() {
+                            self.set_unmapped_null(index, &view);
+                            continue;
+                        }
+
+                        retained.push(r);
                         let clamped = len.min(shadow.left(address)) as usize;
                         if clamped > 0 {
                             add_refresh(&shadow, address as usize, clamped);
@@ -1967,6 +2002,30 @@ void main() {
 
                 // Remap a texture after the previous GPU work completed.
                 if i % 16 == 0 {
+                    let previous = crate::shadow::find(
+                        srv_addr, 64
+                    ).unwrap();
+
+                    // Simulate replacement of registered host copies
+                    // without changing the shader-visible view IDs.
+                    crate::shadow::register(
+                        usize::MAX, srv_addr, 256
+                    );
+
+                    crate::shadow::register(
+                        usize::MAX, uav_addr, 256
+                    );
+
+                    let replacement = crate::shadow::find(
+                        srv_addr, 64
+                    ).unwrap();
+
+                    assert_ne!(
+                        previous.buffer.as_raw(),
+                        replacement.buffer.as_raw(),
+                        "Backing allocation must actually change"
+                    );
+
                     crate::watch::title_memory_remapped(
                         placed_tex_addr as usize,
                         64 << 10,
@@ -2018,7 +2077,12 @@ void main() {
                 64 << 10,
             );
 
-            println!("VERIFIED: sustained GPU streaming and writeback");
+            crate::shadow::unregister(usize::MAX, srv_addr);
+            crate::shadow::unregister(usize::MAX, uav_addr);
+
+            println!(
+                "VERIFIED: sustained streaming, allocation replacement and writeback"
+            );
         }
 
         assert_eq!(release(srv_res), 0);
