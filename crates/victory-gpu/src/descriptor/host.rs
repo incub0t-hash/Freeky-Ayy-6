@@ -1080,19 +1080,11 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot. Returns true for a successfully bound typed R32_UINT texture UAV.
     pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
-        let kept = make(view, self.cpu(index));
+        let mut uint = false;
+        let kept = make_with_type(view, self.cpu(index), &mut uint);
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        let uint = matches!(view, View::Unordered(..))
-            && kept.as_ref().is_some_and(|r| {
-                r.as_ref().is_some_and(|r| {
-                    // SAFETY: this is the resource of the successfully created view.
-                    let d = unsafe { r.GetDesc() };
-                    d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-                        && d.Format == DXGI_FORMAT_R32_UINT
-                })
-            });
         self.keep(index, kept.flatten());
         uint
     }
@@ -1864,12 +1856,23 @@ fn twin_uav(
 /// A candidate does not require, create or keep any host allocation. The
 /// immutable private slot supplies the authoritative type after successful creation.
 pub(crate) fn uint_texture_candidate(view: &View) -> bool {
-    matches!(view, View::Unordered(resource, _, _) if crate::resource::uint_texture_uav(*resource as crate::object::This))
+    match view {
+        View::Unordered(resource, _, words) => {
+            crate::resource::uint_texture_uav(*resource as crate::object::This)
+                || words.is_some_and(|w| w[0] == 42 && matches!(w[1], 2..=5 | 8))
+        }
+        View::Placed(true, r, w) => r[0] != 1 && (w[0] == 42 || (w[0] == 0 && r[8] == 42)),
+        _ => false,
+    }
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    make_with_type(view, at, &mut false)
+}
+
+fn make_with_type(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, uint: &mut bool) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1992,6 +1995,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            // Record the format actually passed to D3D12, including an explicit
+            // typed view of a typeless resource or a substituted depth twin.
+            let own = unsafe { texture.GetDesc() };
+            *uint = own.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                && desc.as_ref().map_or(own.Format, |d| d.Format) == DXGI_FORMAT_R32_UINT;
             Some(Some(texture.clone()))
         }
         View::Sampler(words) => {
@@ -2012,8 +2020,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+            if let Some((view, _lease)) = placed_texture(view) {
+                return make_with_type(&view, at, uint);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -2059,7 +2067,7 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 /// A shader or unordered access view of a texture the title placed in
 /// memory itself, as a view of the resource made for that memory (on first
 /// use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+pub(crate) fn placed_texture(view: &View) -> Option<(View, Option<crate::resource::TargetRef>)> {
     const BUFFER: u32 = 1;
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     let &View::Placed(unordered, mut resource, ref desc) = view else {
@@ -2069,10 +2077,16 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let words = desc[..10].try_into().ok();
+    let mut words: [u32; 10] = desc[..10].try_into().ok()?;
     if unordered {
-        let texture = crate::resource::uav_texture_at(address, &resource, desc[0])?;
-        Some(View::Unordered(texture as usize, 0, words))
+        let texture = crate::resource::uav_texture_at(address, &resource, desc)?;
+        if words[0] == 0 {
+            words[0] = resource[8];
+        }
+        Some((
+            View::Unordered(texture.0 as usize, 0, Some(words)),
+            Some(texture),
+        ))
     } else {
         // Shader views placed in memory take their texels either from title
         // memory or from `TARGETS_AT` (`resource::alias_of`): clear target
@@ -2080,7 +2094,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         // never replaces that target in `TARGETS_AT`.
         resource[12] &= !TARGET_DEPTH_UNORDERED;
         let texture = crate::resource::texture_at(address, &resource)?;
-        Some(View::Shader(texture as usize, words))
+        Some((View::Shader(texture as usize, Some(words)), None))
     }
 }
 
@@ -2535,8 +2549,8 @@ mod tests {
         let mut vol_uav = [0u32; 16];
         (vol_uav[0], vol_uav[1], vol_uav[4]) = (42, 8, 4);
         (vol_uav[10], vol_uav[11]) = (vol_at as u32, (vol_at >> 32) as u32);
-        let slot_mem = [0u64; 4];
-        let slot_handle = slot_mem.as_ptr() as u64;
+        let mut slot_mem = [0u64; 4];
+        let slot_handle = slot_mem.as_mut_ptr() as u64;
         super::super::create_placed_uav(std::ptr::null(), &vol_res, &vol_uav, slot_handle);
         assert!(heap.mirror(0, slot_handle, false).is_some());
         {
@@ -2552,14 +2566,14 @@ mod tests {
 
         // Another placed UAV at the same address with compatible format reuses
         // the resource already recorded in `TARGETS_AT`.
-        let Some(View::Unordered(first_vol, _, _)) =
+        let Some((View::Unordered(first_vol, _, _), _first_vol_lease)) =
             placed_texture(&View::Placed(true, vol_res, vol_uav))
         else {
             panic!("expected View::Unordered");
         };
         let mut explicit_flags = vol_res;
         explicit_flags[12] = 0x4;
-        let Some(View::Unordered(second_vol, _, _)) =
+        let Some((View::Unordered(second_vol, _, _), _second_vol_lease)) =
             placed_texture(&View::Placed(true, explicit_flags, vol_uav))
         else {
             panic!("expected View::Unordered");
@@ -2576,22 +2590,44 @@ mod tests {
         (uav_desc[0], uav_desc[1]) = (42, 4);
         (uav_desc[10], uav_desc[11]) = (alias_at as u32, (alias_at >> 32) as u32);
         let uav_placed = View::Placed(true, rgb9e5_res, uav_desc);
-        let Some(View::Unordered(uav_obj, _, _)) = placed_texture(&uav_placed) else {
+        let Some((View::Unordered(uav_obj, _, _), _uav_obj_lease)) = placed_texture(&uav_placed) else {
             panic!("expected placed UAV texture");
         };
-        assert!(make(&uav_placed, heap.cpu(1)).flatten().is_some());
+        assert!(heap.make_at(1, &uav_placed), "packed writer must use integer stores");
+        let mut invalid = uav_desc;
+        invalid[2] = 1; // past the only level
+        assert!(!heap.make_at(3, &View::Placed(true, rgb9e5_res, invalid)));
+        invalid = uav_desc;
+        invalid[1] = 8; // a volume view of a 2D resource
+        assert!(!heap.make_at(3, &View::Placed(true, rgb9e5_res, invalid)));
+        invalid = uav_desc;
+        invalid[0] = 41; // R32_FLOAT cannot reinterpret RGB9E5 as a writer
+        assert!(!heap.make_at(3, &View::Placed(true, rgb9e5_res, invalid)));
+        let mut wider = rgb9e5_res;
+        wider[4] *= 2;
+        assert!(!heap.make_at(3, &View::Placed(true, wider, uav_desc)));
+        assert!(heap.kept.lock().unwrap()[3].is_none());
+        assert!(heap.make_at(1, &uav_placed), "refused views must preserve the original target");
+        let mut typeless = vol_res;
+        typeless[8] = 39;
+        let mut typed_view = vol_uav;
+        typed_view[10] += 0x10000;
+        assert!(heap.make_at(3, &View::Placed(true, typeless, typed_view)));
+        typed_view[0] = 41;
+        assert!(!heap.make_at(3, &View::Placed(true, typeless, typed_view)));
+        assert!(heap.kept.lock().unwrap()[3].is_some(), "float view of typeless resource is valid");
 
         let mut srv_words = [0u32; 16];
         (srv_words[0], srv_words[1], srv_words[2], srv_words[5]) =
             (67, 4, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 1);
         (srv_words[10], srv_words[11]) = (alias_at as u32, (alias_at >> 32) as u32);
         let srv_placed = View::Placed(false, rgb9e5_res, srv_words);
-        let Some(View::Shader(srv_obj, _)) = placed_texture(&srv_placed) else {
+        let Some((View::Shader(srv_obj, _), _)) = placed_texture(&srv_placed) else {
             panic!("expected placed SRV texture");
         };
         assert!(make(&srv_placed, heap.cpu(2)).flatten().is_some());
         assert_eq!(
-            crate::resource::alias_of(srv_obj as crate::object::This),
+            crate::resource::alias_of(srv_obj as crate::object::This).map(|r| r.0),
             Some(uav_obj as crate::object::This),
             "placed SRV must find the placed UAV texture in TARGETS_AT"
         );
