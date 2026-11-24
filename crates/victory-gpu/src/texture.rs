@@ -39,12 +39,37 @@ pub(crate) struct Staging {
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
-    rows: Vec<u32>,
+    extents: Vec<CopyExtent>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
     last: Mutex<Last>,
+}
+
+/// A placed copy has pitch between rows, but no trailing padding is required
+/// after its last row. Block-compressed formats report rows of blocks here.
+struct CopyExtent {
+    start: usize,
+    len: usize,
+    slice_pitch: usize,
+}
+
+impl CopyExtent {
+    fn new(f: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32, row_bytes: u64, total: u64) -> Option<Self> {
+        let pitch = u64::from(f.Footprint.RowPitch);
+        if row_bytes == 0 || row_bytes > pitch || rows == 0 || f.Footprint.Depth == 0 {
+            return None;
+        }
+        let slice_pitch = pitch.checked_mul(u64::from(rows))?;
+        let len = slice_pitch.checked_mul(u64::from(f.Footprint.Depth - 1))?
+            .checked_add(pitch.checked_mul(u64::from(rows - 1))?)?
+            .checked_add(row_bytes)?;
+        if f.Offset.checked_add(len)? > total || total > isize::MAX as u64 {
+            return None;
+        }
+        Some(Self { start: f.Offset as usize, len: len as usize, slice_pitch: slice_pitch.try_into().ok()? })
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -124,7 +149,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = staging.extents[i].len as u64;
             list.note_read(
                 || {
                     format!(
@@ -236,18 +261,17 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+        for (i, (footprint, extent)) in self.footprints.iter().zip(&self.extents).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            // SAFETY: CopyExtent checked this entire range against the buffer allocation.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(self.data.add(extent.start), extent.len)
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, extent.slice_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -305,6 +329,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    let mut row_bytes = vec![0u64; count as usize];
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -315,10 +340,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            Some(row_bytes.as_mut_ptr()),
             Some(&mut total),
         );
     }
+    let extents = footprints.iter().zip(rows).zip(row_bytes)
+        .map(|((f, rows), row_bytes)| CopyExtent::new(f, rows, row_bytes, total))
+        .collect::<Option<Vec<_>>>()?;
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -333,7 +361,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         size: total,
         data,
         footprints,
-        rows,
+        extents,
         layout,
         mips: u32::from(d.MipLevels),
         memory,
@@ -341,4 +369,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_row_of_last_depth_slice_ends_at_unpadded_width() {
+        let f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 512,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: 256, Depth: 2, ..Default::default() },
+        };
+        let total = 512 + 5 * 256 + 12;
+        let e = CopyExtent::new(&f, 3, 12, total).unwrap();
+        assert_eq!((e.start, e.len, e.slice_pitch), (512, 5 * 256 + 12, 768));
+        assert!(CopyExtent::new(&f, 3, 12, total - 1).is_none());
+    }
 }
