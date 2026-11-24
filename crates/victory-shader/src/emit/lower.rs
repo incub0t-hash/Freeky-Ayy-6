@@ -244,6 +244,8 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// A single virtual wave orders disjoint physical halves' buffer accesses.
+    order_buffer_wave: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// Why a wave64 program that needs its whole wave cannot take the
@@ -425,36 +427,97 @@ fn bounded_constant_fill(p: &Program, res: &Resources) -> bool {
 /// In console flow all 64 threads therefore reach each issued memory fence.
 fn predicated_buffer_work(p: &Program) -> bool {
     let n = p.blocks.len();
-    if !(3..=4).contains(&n) || !matches!(p.blocks[n-1].insts.as_slice(), [i] if i.name() == "s_endpgm")
-        || p.blocks[n-1].exit != Exit::End { return false; }
+    if !(3..=4).contains(&n)
+        || !matches!(p.blocks[n-1].insts.as_slice(), [i] if i.name() == "s_endpgm")
+        || p.blocks[n - 1].exit != Exit::End
+    {
+        return false;
+    }
     let mut loads = false;
     let mut writes = false;
-    for (b, block) in p.blocks[..n-1].iter().enumerate() {
+    for (b, block) in p.blocks[..n - 1].iter().enumerate() {
         let next = b + 1;
-        if next < n-1 {
-            if block.exit != (Exit::Branch { taken: n-1, not_taken: next })
-                || !matches!(block.insts.last(), Some(i) if i.name() == "s_cbranch_execz") { return false; }
-        } else if block.exit != Exit::Jump(next) { return false; }
+        if next < n - 1 {
+            if block.exit
+                != (Exit::Branch {
+                    taken: n - 1,
+                    not_taken: next,
+                })
+                || !matches!(block.insts.last(), Some(i) if i.name() == "s_cbranch_execz")
+            {
+                return false;
+            }
+        } else if block.exit != Exit::Jump(next) {
+            return false;
+        }
         for i in &block.insts {
             let supported = match &i.fields {
-                Fields::Sopp { .. } => matches!(i.name(), "s_cbranch_execz" | "s_inst_prefetch" | "s_waitcnt" | "s_nop"),
-                Fields::Sop { dst: Some(Operand::Scalar { code: 0..=105, .. }), src, .. } =>
-                    matches!(i.name(), "s_mov_b32" | "s_mul_i32") && src.iter().all(|op|
-                        matches!(op, Operand::Scalar { code: 0..=105, .. } | Operand::Const(128..=208) | Operand::Literal(_))),
+                Fields::Sopp { .. } => matches!(
+                    i.name(),
+                    "s_cbranch_execz" | "s_inst_prefetch" | "s_waitcnt" | "s_nop"
+                ),
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code: 0..=105, .. }),
+                    src,
+                    ..
+                } => {
+                    matches!(i.name(), "s_mov_b32" | "s_mul_i32")
+                        && src.iter().all(|op| {
+                            matches!(
+                                op,
+                                Operand::Scalar { code: 0..=105, .. }
+                                    | Operand::Const(128..=208)
+                                    | Operand::Literal(_)
+                            )
+                        })
+                }
                 Fields::Smem { .. } => i.name() == "s_load_dwordx4",
-                Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => matches!(i.name(),
-                    "v_nop" | "v_mov_b32" | "v_add_nc_u32" | "v_add3_u32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
-                    | "v_min_u32" | "v_mul_lo_u32" | "v_lshrrev_b32" | "v_lshlrev_b32" | "v_lshl_add_u32" | "v_lshl_or_b32"
-                    | "v_cmpx_gt_u32" | "v_cmpx_lt_i32" | "v_cmp_ge_u32" | "v_cmp_gt_i32" | "v_cndmask_b32"),
-                Fields::Buffer { lds: false, tfe: false, .. } => match i.name() {
-                    "buffer_load_dword" | "buffer_load_format_x" => { loads = true; true },
-                    "buffer_atomic_add" => { loads = true; writes = true; true },
-                    "buffer_store_dword" | "buffer_store_format_xyzw" => { writes = true; true },
+                Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => matches!(
+                    i.name(),
+                    "v_nop"
+                        | "v_mov_b32"
+                        | "v_add_nc_u32"
+                        | "v_add3_u32"
+                        | "v_and_b32"
+                        | "v_or_b32"
+                        | "v_xor_b32"
+                        | "v_min_u32"
+                        | "v_mul_lo_u32"
+                        | "v_lshrrev_b32"
+                        | "v_lshlrev_b32"
+                        | "v_lshl_add_u32"
+                        | "v_lshl_or_b32"
+                        | "v_cmpx_gt_u32"
+                        | "v_cmpx_lt_i32"
+                        | "v_cmp_ge_u32"
+                        | "v_cmp_gt_i32"
+                        | "v_cndmask_b32"
+                ),
+                Fields::Buffer {
+                    lds: false,
+                    tfe: false,
+                    ..
+                } => match i.name() {
+                    "buffer_load_dword" | "buffer_load_format_x" => {
+                        loads = true;
+                        true
+                    }
+                    "buffer_atomic_add" => {
+                        loads = true;
+                        writes = true;
+                        true
+                    }
+                    "buffer_store_dword" | "buffer_store_format_xyzw" => {
+                        writes = true;
+                        true
+                    }
                     _ => false,
                 },
                 _ => false,
             };
-            if !supported { return false; }
+            if !supported {
+                return false;
+            }
         }
     }
     loads && writes
@@ -738,6 +801,7 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut order_buffer_wave = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -770,7 +834,9 @@ impl<'a> Lower<'a> {
                 && cs.threads == [64, 1, 1]
                 && insts().any(|i| matches!(i.name(), "image_gather4_l" | "image_gather4_l_o"))
                 && insts().any(|i| matches!(i.name(), "s_cbranch_vccz" | "s_cbranch_vccnz"));
-            let reads_whole = split_first_lane || insts().any(whole) || gather_vote;
+            order_buffer_wave = x.native.wave64 && !x.target.runs(64) && x.target.runs(32)
+                && cs.threads == [64, 1, 1] && s.lds_dwords == 0 && predicated_buffer_work(p);
+            let reads_whole = split_first_lane || insts().any(whole) || gather_vote || order_buffer_wave;
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -989,6 +1055,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split,
             console_cf: x.console_cf,
+            order_buffer_wave: x.console_cf && order_buffer_wave,
             wants_console_flow,
             no_console_flow,
             console_flat: None,
@@ -3117,6 +3184,14 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
+            Ok(()) if self.order_buffer_wave && matches!(inst.fields, Fields::Buffer { .. }) => {
+                // buffer() rejoins the predicated memory operation before returning.
+                // Complete both halves' reads and writes before another instruction
+                // could address the same location through a different lane or UAV.
+                let mode = self.s.m.i32(1 | 4); // SyncThreadGroup | UAVFenceThreadGroup
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+                Ok(())
+            }
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {

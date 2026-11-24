@@ -11,6 +11,87 @@ use crate::native::{RootParam, RootType, StageIo};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn predicated_buffer_wave_orders_overlapping_lanes_and_atomic_results() {
+    let host = Host::new(false).expect("hardware GPU");
+    if !host.target().runs(32) || host.target().runs(64) {
+        return;
+    }
+    fn kernel(active: u32, body: &[u32]) -> crate::NativeProgram {
+        let mut code = vec![
+            0x7da8_0080 + active,                // v_cmpx_gt_u32 exec, active, v0
+            0xbf88_0000 + body.len() as u32 + 4, // s_cbranch_execz to endpgm
+        ];
+        code.extend_from_slice(body);
+        let mut p = program(&code, 64);
+        p.used = vec![crate::native::UsedResource {
+            kind: crate::native::ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        p
+    }
+    for active in [48u32, 64] {
+        for partner in [0, 32] {
+            let swap = kernel(
+                active,
+                &[
+                    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+                    0xe070_1000,
+                    0x8001_0003,           // store lane identity at its own dword
+                    0x3a02_0080 + partner, // v_xor_b32 v1, partner, v0
+                    0x3402_0282,           // v_lshlrev_b32 v1, 2, v1
+                    0xe030_1000,
+                    0x8001_0201, // load partner from the same UAV
+                    0xbf8c_3f70, // s_waitcnt vmcnt(0)
+                ],
+            );
+            assert_eq!(
+                wave_size(&emit_for(&swap, host.target()).unwrap().dxil),
+                Some(32)
+            );
+            let expected: Vec<_> = (0..64)
+                .map(|i| {
+                    if i < active && (i ^ partner) < active {
+                        i ^ partner
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            assert_eq!(run(&host, &swap, 1).unwrap(), expected);
+        }
+        let atom = kernel(
+            active,
+            &[
+                0x7e02_0280, // v_mov_b32 v1, 0: all lanes reserve from dword 0
+                0x7e04_0281, // v_mov_b32 v2, 1
+                0xe0c8_5000,
+                0x8001_0201, // buffer_atomic_add v2, v1, s[4:7], 0 offen glc
+                0xbf8c_3f70, // s_waitcnt vmcnt(0)
+            ],
+        );
+        // The subsequent output writes overlap the counter at lane 0. All
+        // increments must finish first; each active lane owns one distinct reservation.
+        let out = run(&host, &atom, 1).unwrap();
+        let mut reservations = out[..active as usize].to_vec();
+        reservations.sort_unstable();
+        assert_eq!(reservations, (0..active).collect::<Vec<_>>());
+        assert!(out[active as usize..].iter().all(|&x| x == 0));
+    }
+    // A different CFG must not gain this single-wave admission.
+    let other = program(&[0xe030_1000, 0x8001_0200], 64);
+    assert_ne!(
+        wave_size(&emit_for(&other, host.target()).unwrap().dxil),
+        Some(32)
+    );
+}
+
+#[test]
 fn one_thread_argument_writer_does_not_require_a_native_wave64() {
     let mut native = program(&[0x7e04_0281], 1);
     // Eliminate the group/thread offset math from the general test helper.
