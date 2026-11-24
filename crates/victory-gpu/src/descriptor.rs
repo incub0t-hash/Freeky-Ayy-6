@@ -59,6 +59,8 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_serial: u64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -123,6 +125,61 @@ const SHADER_VISIBLE: u32 = 1;
 /// start, end, heap.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod observation {
+    use super::*;
+
+    /// The descriptor's immutable identity and validated payload, without relying
+    /// on the title still mapping the table at a later submission.
+    pub(crate) fn view(handle: u64) -> Option<(u64, View)> {
+        handle.checked_add(12)?;
+        let mut words = [0u8; 12];
+        if handle == 0 || !crate::host::read_into(handle as *const u8, &mut words) {
+            return None;
+        }
+        let [tag, index, generation] = std::array::from_fn(|i| {
+            u32::from_le_bytes(words[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        if tag != VIEW_TAG {
+            return None;
+        }
+        Some((u64::from(index) | (u64::from(generation) << 32), view_at(index, generation)?))
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct BoundHeap(usize, u64);
+
+    fn while_live<T>(object: usize, inspect: impl FnOnce(&Heap) -> T) -> Option<T> {
+        let heaps = SHADER_HEAPS.try_lock().ok()?;
+        heaps.iter().find(|&&(_, _, at)| at == object)?;
+        // SAFETY: Drop unregisters the heap under this lock before freeing it.
+        let heap = unsafe { &*(object as *const Heap) };
+        (heap.desc.kind == VIEWS_KIND).then(|| inspect(heap))
+    }
+
+    pub(crate) fn bound_heap(object: usize) -> Option<BoundHeap> {
+        while_live(object, |heap| BoundHeap(object, heap.trace_serial))
+    }
+
+    impl BoundHeap {
+        pub(crate) fn slot(self, index: u32) -> String {
+            while_live(self.0, |heap| {
+                if heap.trace_serial != self.1 {
+                    return "bound heap replaced".into();
+                }
+                let Some(handle) = heap.handle(index) else {
+                    return format!("outside guest heap count={}", heap.desc.count);
+                };
+                let guest = view(handle);
+                let host = heap.host.get().and_then(Option::as_ref);
+                let mirrored = host.map(|h| h.observed_slot(index));
+                let changed = guest != view(handle);
+                format!("guest={guest:?} host={mirrored:?} host_count={:?} changed={changed}", host.map(|h| h.count()))
+            }).unwrap_or_else(|| "bound heap released or registry busy".into())
+        }
+    }
+}
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
@@ -946,6 +1003,11 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        trace_serial: {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        },
     });
     #[cfg(windows)]
     if visible {
@@ -1001,6 +1063,35 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn puddle_observation_respects_guest_heap_extent_identity_and_lifetime() {
+        let desc = HeapDesc { kind: 0, count: 3, flags: 1, nodes: 0 };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let bound = observation::bound_heap(h as usize).unwrap();
+        let handle = heap(h).handle(2).unwrap();
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4], resource[6], resource[7], resource[8]) =
+            (3, 96, 64, 1 | (6 << 16), 28);
+        let mut srv = [0u32; 16];
+        (srv[0], srv[1], srv[4], srv[5]) = (28, 4, 2, 3);
+        create_placed_srv(std::ptr::null(), &resource, &srv, handle);
+        assert_eq!(observation::view(handle).unwrap().1, View::Placed(false, resource, srv));
+        let line = bound.slot(2);
+        assert!(line.contains("Placed(false") && line.contains("host_count=None"), "{line}");
+        assert!(heap(h).host.get().is_none(), "probe must not make a host heap");
+        assert!(bound.slot(3).contains("outside guest heap"));
+        assert!(observation::view(1).is_none());
+        assert!(observation::view(u64::MAX).is_none());
+        // A changed material view cannot be mistaken for the recorded one.
+        let key = observation::view(handle).unwrap().0;
+        create_cbv(std::ptr::null(), &[0x200, 0, 256, 0], handle);
+        assert_ne!(observation::view(handle).unwrap().0, key);
+        assert_eq!(release(h), 0);
+        assert!(bound.slot(2).contains("released"));
     }
 
     #[test]
