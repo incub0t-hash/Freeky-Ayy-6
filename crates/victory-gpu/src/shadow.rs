@@ -66,14 +66,47 @@ fn pooled(n: usize) -> Vec<u8> {
 }
 
 /// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+
 fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+    const BUDGET: usize = 64 << 20;
+
+    let mut pool = POOL.lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    recycle_snapshot(&mut pool, v, BUDGET);
 }
+
+fn recycle_snapshot(
+    pool: &mut Vec<Vec<u8>>,
+    mut v: Vec<u8>,
+    budget: usize,
+) {
+    let capacity = v.capacity();
+
+    // Oversized completed snapshots are released, not cached.
+    if capacity == 0 || capacity > budget {
+        return;
+    }
+
+    v.clear();
+
+    while pool.len() >= 8 ||
+        pool.iter().map(|b| b.capacity()).sum::<usize>()
+            > budget - capacity
+    {
+        let Some((index, _)) = pool.iter()
+            .enumerate()
+            .max_by_key(|(_, b)| b.capacity())
+        else {
+            return;
+        };
+
+        pool.swap_remove(index);
+    }
+
+    pool.push(v);
+}
+
 
 const NOT_WATCHED: u8 = 2;
 
@@ -268,14 +301,16 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let page_from = (from / PAGE * PAGE).max(start);
+        let page_to = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut busy: Vec<(usize, usize)> = pending
             .iter()
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        let pages_busy = pending.iter().any(|&(a, e)| a < page_to && e > page_from);
+        drop(pending);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -284,30 +319,45 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, false);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, false);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, !pages_busy)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    /// shader writes. When `whole_pages` is true (no pending GPU write overlaps
+    /// the enclosing 64 KiB pages) and the memory is write-watched, stale pages
+    /// are copied whole so they are marked clean and not re-copied on every
+    /// later submission.
+    fn update_free(&self, from: usize, to: usize, whole_pages: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let (copy_from, copy_to) = if whole_pages {
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    (
+                        (from / PAGE * PAGE).max(start),
+                        to.div_ceil(PAGE).saturating_mul(PAGE).min(end),
+                    )
+                } else {
+                    (from, to)
+                };
+                let copied = self.copy_stale(copy_from, copy_to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    add(C::Checked, (copy_to - copy_from) as u64);
+                    add(
+                        C::Unchanged,
+                        (copy_to - copy_from).saturating_sub(copied) as u64,
+                    );
                 }
                 return copied;
             }
@@ -463,6 +513,20 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
+
+    if map.len().is_power_of_two() {
+        let bytes: u64 = map.keys()
+            .map(|(_, len)| *len)
+            .sum();
+
+        tracing::info!(
+            windows = map.len(),
+            allocated_bytes = bytes,
+            allocated_mib = bytes >> 20,
+            "loose shadow cache growth"
+        );
+    }
+
     Some(shadow)
 }
 
@@ -496,4 +560,34 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+
+#[cfg(test)]
+mod snapshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn unused_snapshots_stay_within_budget() {
+        let mut pool = Vec::new();
+
+        for size in [16, 32, 48, 128, 8, 24, 40, 64] {
+            recycle_snapshot(
+                &mut pool,
+                Vec::with_capacity(size),
+                64,
+            );
+
+            assert!(
+                pool.iter()
+                    .map(|v| v.capacity())
+                    .sum::<usize>() <= 64
+            );
+
+            assert!(pool.len() <= 8);
+        }
+
+        assert!(!pool.is_empty());
+        assert!(pool.iter().all(|v| v.is_empty()));
+    }
 }
