@@ -1285,3 +1285,276 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+
+#[test]
+fn strict_mesh_pixel_oracle() {
+    let pc = std::env::var_os("VICTORY_PC_DXC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            super::validator::Validator::default_path()
+                .map(|p| p.with_file_name("dxc.exe"))
+        })
+        .expect("Install or configure the public PC DXC compiler");
+
+    assert!(pc.is_file(), "PC DXC not found: {pc:?}");
+
+    let host = Host::on("RTX 3080 Ti")
+        .expect("Required NVIDIA hardware unavailable");
+
+    let dir = std::env::temp_dir().join(
+        format!("victory-mesh-oracle-{}", std::process::id())
+    );
+
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
+
+    for wanted in ["one triangle", "two waves"] {
+        let &(_, groups, source) = MS_CASES.iter()
+            .find(|c| c.0 == wanted)
+            .expect("Synthetic mesh fixture");
+
+        let ms = compile(&pc, &dir, source, "ms", "ms_6_5");
+        let ps = compile(&pc, &dir, source, "mps", "ps_6_5");
+
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(0, &ms)
+        }.expect("Mesh root signature");
+
+        let pso = host.mesh_pipeline_with(&root, &ms, &ps)
+            .expect("Mesh pipeline");
+
+        let pixels = host.draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![(0, Root::Constants(k.to_vec()))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (16, 16),
+                mesh_groups: groups,
+            },
+        ).expect("GPU raster readback");
+
+        assert_eq!(pixels.len(), 256);
+
+        for (i, pixel) in pixels.iter().enumerate() {
+            assert!(
+                pixel.iter().all(|v| v.is_finite()),
+                "Non-finite pixel {i}: {pixel:?}"
+            );
+
+            assert!(
+                (pixel[3] - 1.0).abs() < 0.001,
+                "Missing geometry at pixel {i}: {pixel:?}"
+            );
+
+            if wanted == "one triangle" {
+                let u = ((i % 16) as f32 + 0.5) / 16.0;
+                let v = 1.0 - ((i / 16) as f32 + 0.5) / 16.0;
+
+                let expected = [
+                    1.25 * (u * 0.5 + v),
+                    -1.375,
+                    v,
+                    1.0,
+                ];
+
+                for channel in 0..4 {
+                    assert!(
+                        (pixel[channel] - expected[channel]).abs()
+                            < 0.002,
+                        "Pixel {i}, channel {channel}: \
+                         got {}, expected {}",
+                        pixel[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
+
+        println!(
+            "VERIFIED NVIDIA raster output: {wanted}, \
+             {} pixels covered",
+            pixels.len()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+
+#[test]
+fn translated_pixel_raster_oracle() {
+    use crate::native::{NativeProgram, HwStage, StageIo};
+    use super::container::SigElement;
+
+    let pc = std::env::var_os("VICTORY_PC_DXC")
+        .map(PathBuf::from)
+        .or_else(|| {
+            super::validator::Validator::default_path()
+                .map(|p| p.with_file_name("dxc.exe"))
+        })
+        .expect("PC DXC compiler");
+
+    let host = Host::on("RTX 3080 Ti")
+        .expect("NVIDIA hardware required");
+
+    let dir = std::env::temp_dir().join(
+        format!("victory-translated-raster-{}", std::process::id())
+    );
+
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
+
+    let cases = [
+        [1.0f32, 0.5, 0.25, 1.0],
+        [0.125f32, 0.75, 0.375, 1.0],
+    ];
+
+    let output = super::container::signature(
+        &[SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }],
+        false,
+    );
+
+    let bytes = crate::dxbc::build(&[
+        (super::FourCC::OSG1, &output)
+    ]);
+
+    let container = super::Container::parse(&bytes).unwrap();
+
+    for wanted in ["one triangle", "two waves"] {
+        let &(_, groups, source) = MS_CASES.iter()
+            .find(|c| c.0 == wanted)
+            .unwrap();
+
+        let ms = compile(&pc, &dir, source, "ms", "ms_6_5");
+
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(0, &ms)
+        }.unwrap();
+
+        for wave64 in [false, true] {
+            for expected in cases {
+                let mut words = Vec::<u32>::new();
+
+                // Four literal RDNA v_mov_b32 instructions.
+                for (reg, value) in expected.iter().enumerate() {
+                    words.push(
+                        0x7E00_02FF | ((reg as u32) << 17)
+                    );
+                    words.push(value.to_bits());
+                }
+
+                // Export RGBA, then terminate.
+                words.extend([
+                    0xF800_180F,
+                    0x0302_0100,
+                    0xBF81_0000,
+                ]);
+
+                let native = NativeProgram {
+                    stage: HwStage::Ps,
+                    wave64,
+                    vgprs: 4,
+                    layout: vec![],
+                    used: vec![],
+                    io: StageIo::Ps {
+                        inputs: vec![],
+                        input_addr: 0,
+                        db_shader_control: 0,
+                        patches: vec![],
+                    },
+                    code: words.iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect(),
+                };
+
+                let ir = crate::ir::build(
+                    &native.patched_code(),
+                    native.wave64,
+                    native.vgprs,
+                ).unwrap();
+
+                let res = crate::resource::track(
+                    &ir, &native.layout, native.stage
+                ).unwrap();
+
+                let io = crate::io::raise(&ir, &native).unwrap();
+                let st = crate::structure::structure(&ir).unwrap();
+
+                let mut ps = super::emit(
+                    &container, &native, &ir,
+                    &st, &io, &res, host.target(),
+                ).unwrap();
+
+                let validator_path =
+                    super::validator::Validator::default_path();
+
+                let mut validator =
+                    super::validator::Validator::load(
+                        validator_path.as_deref()
+                    ).expect("DXIL validator required");
+
+                validator.validate(&mut ps.dxil).unwrap();
+
+                let pso = host.mesh_pipeline_with(
+                    &root, &ms, &ps.dxil
+                ).expect("Translated graphics pipeline");
+
+                let pixels = host.draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![
+                            (0, Root::Constants(k.to_vec()))
+                        ],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: groups,
+                    },
+                ).expect("Translated raster output");
+
+                assert_eq!(pixels.len(), 256);
+
+                for (i, pixel) in pixels.iter().enumerate() {
+                    for c in 0..4 {
+                        assert!(
+                            pixel[c].is_finite() &&
+                            (pixel[c] - expected[c]).abs() < 0.00001,
+                            "Pixel {i} channel {c}: got {}, expected {}",
+                            pixel[c], expected[c]
+                        );
+                    }
+                }
+
+                println!(
+                    "VERIFIED translated raster: {wanted}, \
+                     wave64={wave64}, RGBA={expected:?}, \
+                     {} exact pixels",
+                    pixels.len()
+                );
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
