@@ -14,6 +14,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::host::{Draw, Host, Root};
 use super::{HostShader, RootType, translate};
 
+#[path = "barycentric_tests.rs"]
+mod barycentric_tests;
+
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
                   RootConstants(num32BitConstants=4, b0), \
                   DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)), \

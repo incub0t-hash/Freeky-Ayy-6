@@ -37,6 +37,7 @@ impl SigElement {
             10 => 7, // primitive id
             12 => 10,
             13 => 9, // front face
+            28 => 23, // barycentrics
             14 => 66,
             15 => 70,
             16 => 64, // target

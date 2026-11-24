@@ -26,6 +26,8 @@ type Why = &'static str;
 enum Val {
     I32(V),
     Bit(V),
+    /// Raw center coordinate, materialized only when read as arithmetic data.
+    CenterBary(u8),
     Missing(Why),
 }
 
@@ -1356,9 +1358,8 @@ impl<'a> Lower<'a> {
             }
             // Ordinary interpolation pairs consume no raw coordinate. Only
             // materialize this optional host input if a live use asks for it.
-            Input::Barycentric { kind: Barycentric::PerspectiveCenter, .. } => {
-                return Val::Missing(CENTER_BARY);
-            }
+            Input::Barycentric { kind: Barycentric::PerspectiveCenter, index: index @ 0..=1 } =>
+                return Val::CenterBary(index),
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
@@ -1508,16 +1509,9 @@ impl<'a> Lower<'a> {
     /// independent of the optional SV_Barycentrics capability.
     fn live_input(&mut self, v: Value) -> Option<Val> {
         let stored = self.vals.get(&v).copied()?;
-        if !matches!(stored, Val::Missing(CENTER_BARY)) {
+        let Val::CenterBary(index) = stored else {
             return Some(stored);
-        }
-        let index = self.x.io.inputs.iter().find_map(|&(value, input)| {
-            match input {
-                Input::Barycentric { kind: Barycentric::PerspectiveCenter, index: index @ 0..=1 }
-                    if value == v => Some(index),
-                _ => None,
-            }
-        })?;
+        };
         let id = self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == 2)
             .unwrap_or_else(|| {
                 self.s.inputs.push(SigElement {
@@ -1558,6 +1552,7 @@ impl<'a> Lower<'a> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
             Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
+            Val::CenterBary(_) => unreachable!("get materializes raw pixel coordinates"),
             Val::Missing(w) => Err(w),
         }
     }
@@ -2040,6 +2035,7 @@ impl<'a> Lower<'a> {
                     Ok(self.s.m.cmp(at, pred::NE, x, z))
                 }
                 Val::Missing(w) => Err(w),
+                Val::CenterBary(_) => unreachable!("get materializes raw pixel coordinates"),
             },
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
