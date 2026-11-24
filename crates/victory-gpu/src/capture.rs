@@ -47,7 +47,8 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)
+        || scene_capture().is_some_and(|(_, _, offset)| offset == after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -340,6 +341,18 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// A single capture of full-resolution render and depth targets, counted
+/// from the first 500-draw frame. For example, `2560x1440@240`.
+fn scene_capture() -> Option<(u64, u32, u64)> {
+    static SELECT: std::sync::OnceLock<Option<(u64, u32, u64)>> = std::sync::OnceLock::new();
+    *SELECT.get_or_init(|| {
+        let value = std::env::var("VICTORY_DUMP_SCENE_AT").ok()?;
+        let (size, after) = value.split_once('@')?;
+        let (w, h) = size.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?, after.parse().ok()?))
+    })
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -347,13 +360,30 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    let filter = scene_capture();
+    if resource.is_null() || (!dump_on() && filter.is_none()) || folder().is_none() {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        return;
+    }
+    if let Some((_, _, after)) = filter
+        && WORLD.load(std::sync::atomic::Ordering::Relaxed).checked_add(after) != Some(frame) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
+        if let Some((width, height, _)) = filter {
+            // SAFETY: the retained host copy owns this texture.
+            let desc = unsafe { copy.texture.GetDesc() };
+            let flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if desc.Width != width || desc.Height != height || (desc.Flags & flags).0 == 0 {
+                return;
+            }
+        }
         targets.push((resource as usize, copy));
     }
 }
