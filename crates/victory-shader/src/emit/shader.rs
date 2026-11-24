@@ -131,6 +131,51 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The [`VIEW_LIMIT`] shaders are translated with now (0: none).
+pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some((limit, _)) = TEST_VIEW_HEAP.get() {
+        return limit;
+    }
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The heap map of a host view heap capped below the title's slots (see
+/// `Lower::heap_remap`), packed: its identity window in the high 32 bits,
+/// the view heap slot of the map (a raw buffer) in the low ones; `u64::MAX`:
+/// none. Set with [`VIEW_LIMIT`], before the first shader is translated: a
+/// shader keeps the map it was translated with, and the host lays its view
+/// heap out by the same values.
+static VIEW_MAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// See [`VIEW_MAP`]: `Some((window, slot))` makes shaders translated from
+/// now on look a view they take from the resource heap itself up in the
+/// heap map at view heap slot `slot` when its index is `window` or more;
+/// `None` reads every index in place.
+pub fn set_view_heap_map(map: Option<(u32, u32)>) {
+    let packed = map.map_or(u64::MAX, |(window, slot)| u64::from(window) << 32 | u64::from(slot));
+    VIEW_MAP.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The heap map shaders are translated with now ([`set_view_heap_map`]).
+pub fn view_heap_map() -> Option<(u32, u32)> {
+    #[cfg(test)]
+    if let Some((_, map)) = TEST_VIEW_HEAP.get() {
+        return map;
+    }
+    let packed = VIEW_MAP.load(std::sync::atomic::Ordering::Relaxed);
+    (packed != u64::MAX).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the view heap limit and heap map shaders this thread
+    /// translates are made with, in place of [`VIEW_LIMIT`] and
+    /// [`VIEW_MAP`], without reaching other tests' translations.
+    pub(crate) static TEST_VIEW_HEAP: std::cell::Cell<Option<(u32, Option<(u32, u32)>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -404,7 +449,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);

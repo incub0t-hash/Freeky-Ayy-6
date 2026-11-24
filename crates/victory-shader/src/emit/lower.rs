@@ -213,6 +213,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// The heap map's handle ([`Lower::heap_remap`]), made once in the
+    /// entry block.
+    heap_map: Option<V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1497,6 +1500,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             strides: HashMap::new(),
+            heap_map: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -6257,7 +6261,8 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        // The table is by title slot: the index before any heap map.
+        let (slot, _) = self.title_heap_index(*load, *first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6356,10 +6361,10 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -6386,20 +6391,35 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.host_index(index, root, sampler))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
-    /// load at `load` reads, computed in the current block.
+    /// load at `load` reads, computed in the current block, as the host
+    /// heap has it ([`Lower::host_index`]).
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        let (index, root) = self.title_heap_index(load, first, sampler)?;
+        Ok(self.host_index(index, root, sampler))
+    }
+
+    /// The heap index of the descriptor at dword `first` of what the scalar
+    /// load at `load` reads, computed in the current block, as the title's
+    /// address gives it; and the root type of what it is read through.
+    fn title_heap_index(
+        &mut self,
+        load: Site,
+        first: u8,
+        sampler: bool,
+    ) -> Result<(V, RootType), Why> {
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -6426,7 +6446,76 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        Ok((self.s.m.bin(c, Bin::LShr, addr, shift), root))
+    }
+
+    /// Heap index `index` of a descriptor read through a root parameter of
+    /// type `root`, as the host heap has it: a view taken from the resource
+    /// heap itself is at its title index, which the host may map
+    /// ([`Lower::heap_remap`]); a table's index is the host's already (the
+    /// host makes a table that reaches past the map's identity window
+    /// afresh in slots of its own), and so is a sampler's.
+    fn host_index(&mut self, index: V, root: RootType, sampler: bool) -> V {
+        match super::shader::view_heap_map() {
+            Some((window, slot)) if root == RootType::ResourceHeap && !sampler => {
+                self.heap_remap(index, window, slot)
+            }
+            _ => index,
+        }
+    }
+
+    /// Title heap index `index` of a view as the host's, under a heap map
+    /// ([`super::shader::set_view_heap_map`]): below the identity window
+    /// `window`, itself; past it, the slot the heap map gives. A host view
+    /// heap capped below the title's slots (NVIDIA takes 1,000,000 views,
+    /// the title's heap has 1,245,184) mirrors title slots below
+    /// the window at their own index and gives each one past it that holds
+    /// a view a slot of its own; the heap map, a raw buffer at view heap
+    /// slot `slot`, holds per title slot from the window on that slot's
+    /// bitwise not. An entry never written (or a read past the map, which
+    /// gives 0) is `u32::MAX`, which [`super::shader::Shader::heap_handle`]
+    /// then clamps to the heap's null slot.
+    ///
+    /// Branchless (a load and selects): [`Lower::heap_index`] may run in a
+    /// predecessor's tail for a phi. The map's handle is uniform, made once
+    /// in the entry block; only the offset is per lane.
+    fn heap_remap(&mut self, index: V, window: u32, slot: u32) -> V {
+        let map = match self.heap_map {
+            Some(map) => map,
+            None => {
+                let entry = self.s.entry;
+                let at = self.s.m.i32(slot);
+                let map = self.s.heap_handle(entry, at, false, false, (11, 0));
+                self.heap_map = Some(map);
+                map
+            }
+        };
+        let c = self.cur;
+        let w = self.s.m.i32(window);
+        // The entry's byte offset; a title index so far past the map that
+        // it would wrap onto it reads past the end instead.
+        let d = self.s.m.bin(c, Bin::Sub, index, w);
+        let limit = self.s.m.i32(1 << 30);
+        let near = self.s.m.cmp(c, pred::IULT, d, limit);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, d, two);
+        let past = self.s.m.i32(!3u32);
+        let byte = self.s.m.select(c, near, byte, past);
+        let (iu, mask, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[map, byte, iu, mask, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        let entry = self.as_int(x);
+        let ones = self.s.m.i32(u32::MAX);
+        let mapped = self.s.m.bin(c, Bin::Xor, entry, ones);
+        let inside = self.s.m.cmp(c, pred::IULT, index, w);
+        self.s.m.select(c, inside, index, mapped)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

@@ -77,6 +77,15 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                // And the view heap the host keeps (`probe_view_limit`, which
+                // runs before the first translation): the clamp of view
+                // indices and the heap map bindless views are looked up in
+                // (`VICTORY_HEAP_MAP`, `VICTORY_HEAP_WINDOW`).
+                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+                let map = victory_shader::emit::view_heap_map().map_or([u32::MAX; 2], |(w, s)| [w, s]);
+                for word in map {
+                    bytes.extend_from_slice(&word.to_le_bytes());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
