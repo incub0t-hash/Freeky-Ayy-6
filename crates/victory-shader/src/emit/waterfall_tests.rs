@@ -76,6 +76,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
+        stride_table: lowered.stride_table,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

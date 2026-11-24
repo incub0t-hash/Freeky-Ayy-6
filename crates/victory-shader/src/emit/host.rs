@@ -1519,6 +1519,7 @@ mod tests {
         s.wave_size = wave_size;
         s.m.terminate(s.entry, Term::Ret);
         HostShader {
+            stride_table: false,
             stage: crate::HwStage::Cs,
             dxil: s.finish(),
             user_data: Vec::new(),
