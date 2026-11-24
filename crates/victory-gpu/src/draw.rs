@@ -491,6 +491,10 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                if compute {
+                    self.trace_compute_bindings(&stage.shader.hash, &t.used, &made, &values);
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -633,6 +637,44 @@ impl State {
             &self.compute
         } else {
             &self.graphics
+        }
+    }
+
+    /// Report the actual root values, remapped heap slot and retained resource for
+    /// a few dispatches of each compute stage selected for invocation capture.
+    #[cfg(feature = "diagnostics")]
+    fn trace_compute_bindings(&self, hash: &str, used: &[UsedResource], made: &[(u8, u32)], values: &[u32]) {
+        use std::{collections::HashMap, sync::{Mutex, OnceLock}};
+        if !crate::capture::stage_query::watched().iter().any(|wanted| wanted == hash) { return; }
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        let recording = {
+            let mut counts = COUNTS.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+            let n = counts.entry(hash.to_owned()).or_default();
+            *n = n.saturating_add(1);
+            if *n > 64 || !n.is_power_of_two() { return; }
+            *n
+        };
+        tracing::info!(hash, recording, ?values, "sampled compute root dwords");
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            let Some(&Root::Table(table)) = self.compute.get(usize::from(u.slot)) else {
+                tracing::info!(hash, recording, slot = u.slot, "sampled compute table missing");
+                continue;
+            };
+            let guest = table.checked_add(u64::from(u.table_offset_dwords) * 4);
+            let heap = self.heap_of(table);
+            let view = heap.and_then(|h| guest.filter(|&at| h.index(at).is_some()))
+                .and_then(crate::descriptor::view);
+            let fresh = made.iter().find(|&&(slot, _)| slot == u.slot).map(|&(_, bytes)| bytes / 32);
+            let index = fresh.or_else(|| heap.and_then(|h| h.index(table)))
+                .and_then(|base| base.checked_add(u.table_offset_dwords / 8));
+            // Fresh constant views use the command list's upload resource; SRV/UAV
+            // creation instead retains the actual backing object in the heap slot.
+            let backed = (u.kind != ResourceType::Cbv).then(|| heap.and_then(|h| h.host())
+                .and_then(|host| index.and_then(|i| host.retains_resource(i)))).flatten();
+            let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+            tracing::info!(hash, recording, slot = u.slot, offset = u.table_offset_dwords,
+                kind = ?u.kind, stride = u.stride, ?index, ?backed, ?range, ?view,
+                "sampled compute table descriptor");
         }
     }
 
