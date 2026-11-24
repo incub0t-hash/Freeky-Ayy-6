@@ -113,8 +113,6 @@ pub(super) fn heap_raw_loads(n: &NativeProgram, p: &Program, res: &Resources) ->
 /// every use of its value is the guest view index multiplied by 32 and every
 /// use of that result loads the identical four-dword raw buffer descriptor.
 pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) -> Vec<u32> {
-    use crate::gfx10::Operand;
-    use crate::ir::{Reg, Value};
     let raw = heap_raw_loads(n, p, res);
     if raw.is_empty() {
         return Vec::new();
@@ -145,6 +143,86 @@ pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) ->
             }
         }
     }
+    selections(n, p, res, &raw_loads, &excluded)
+        .into_keys()
+        .collect()
+}
+
+/// Each scalar-only heap load selected by an exclusive root constant, and
+/// the original user SGPR value whose five shifted-out bits are available
+/// to communicate the concrete host descriptor kind.
+pub(super) fn scalar_selections(
+    n: &NativeProgram,
+    p: &Program,
+    res: &Resources,
+) -> BTreeMap<Site, (u32, crate::ir::Value)> {
+    if n.stage != HwStage::Cs {
+        return BTreeMap::new();
+    }
+    let mut consumers = BTreeMap::<Site, Vec<Site>>::new();
+    let mut excluded = BTreeSet::new();
+    for d in &res.descriptors {
+        let i = &p.blocks[d.site.0].insts[d.site.1];
+        if let Source::Loaded { load, first: 0 } = d.source
+            && d.role == Role::Resource
+            && i.name().starts_with("s_buffer_load_dword")
+        {
+            consumers.entry(load).or_default().push(d.site);
+        } else {
+            for leaf in d.source.leaves() {
+                if let Source::Loaded { load, .. } = leaf {
+                    excluded.insert(*load);
+                }
+            }
+        }
+    }
+    // Replacing a descriptor preserves its accessible bytes. It cannot
+    // preserve arbitrary arithmetic on the descriptor words themselves.
+    let mut owner = BTreeMap::new();
+    for &load in consumers.keys() {
+        for &(_, v) in &p.blocks[load.0].insts[load.1].writes {
+            owner.insert(v, load);
+        }
+    }
+    for (b, blk) in p.blocks.iter().enumerate() {
+        for val in blk.phis.iter().flat_map(|phi| &phi.args) {
+            if let Some(load) = owner.get(val) {
+                excluded.insert(*load);
+            }
+        }
+        for (k, i) in blk.insts.iter().enumerate() {
+            for &(reg, v) in &i.reads {
+                let Some(&load) = owner.get(&v) else { continue };
+                let direct_operand = matches!(&i.fields,Fields::Smem{base:crate::gfx10::Operand::Scalar{code,dwords:4},soffset,..}
+                    if matches!(reg,crate::ir::Reg::S(r) if (u16::from(*code)..u16::from(*code)+4).contains(&u16::from(r)))
+                    && !matches!(soffset,crate::gfx10::Operand::Scalar{code,..} if reg==crate::ir::Reg::S(*code)));
+                if !direct_operand || !consumers[&load].contains(&(b, k)) {
+                    excluded.insert(load);
+                }
+            }
+        }
+    }
+    let captures = selections(n, p, res, &consumers.keys().copied().collect(), &excluded);
+    let mut result = BTreeMap::new();
+    for (index, (v, loads)) in captures {
+        for load in loads {
+            for &site in &consumers[&load] {
+                result.insert(site, (index, v));
+            }
+        }
+    }
+    result
+}
+
+fn selections(
+    n: &NativeProgram,
+    p: &Program,
+    res: &Resources,
+    allowed: &BTreeSet<Site>,
+    excluded: &BTreeSet<Site>,
+) -> BTreeMap<u32, (crate::ir::Value, BTreeSet<Site>)> {
+    use crate::gfx10::Operand;
+    use crate::ir::{Reg, Value};
     let mut uses = BTreeMap::<Value, Vec<Option<Site>>>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for phi in &block.phis {
@@ -159,7 +237,7 @@ pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) ->
         }
     }
     let addresses: BTreeMap<_, _> = res.scalar.iter().copied().collect();
-    let mut indices = BTreeSet::new();
+    let mut indices = BTreeMap::new();
     for &(value, param, dword) in &res.params {
         let root = &n.layout[param];
         if root.root != RootType::Constants {
@@ -168,7 +246,8 @@ pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) ->
         let Some(uses_of_value) = uses.get(&value) else {
             continue;
         };
-        let all_raw = uses_of_value.iter().all(|site| {
+        let mut selected = BTreeSet::new();
+        let all_selected = uses_of_value.iter().all(|site| {
             let Some((b, i)) = *site else { return false };
             let shift = &p.blocks[b].insts[i];
             let Fields::Sop {
@@ -197,7 +276,8 @@ pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) ->
                 reads.iter().all(|site| {
                     let Some(site) = site else { return false };
                     let inst = &p.blocks[site.0].insts[site.1];
-                    raw_loads.contains(site)
+                    selected.insert(*site);
+                    allowed.contains(site)
                         && !excluded.contains(site)
                         && inst.name() == "s_load_dwordx4"
                         && addresses.get(site).is_some_and(|a| {
@@ -210,11 +290,11 @@ pub(super) fn direct_indices(n: &NativeProgram, p: &Program, res: &Resources) ->
                 })
             })
         });
-        if all_raw {
-            indices.insert(u32::from(root.user_data) + dword);
+        if all_selected && !selected.is_empty() {
+            indices.insert(u32::from(root.user_data) + dword, (value, selected));
         }
     }
-    indices.into_iter().collect()
+    indices
 }
 
 #[cfg(all(test, windows))]
@@ -315,31 +395,45 @@ mod tests {
             (true, 0x8f09_8502u32, false),
             (false, 0x8f09_8402u32, false),
         ] {
-            let mut n = native(RootType::ResourceHeap, true);
-            n.layout.push(RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 2,
-                slot: 2,
-            });
-            let StageIo::Cs(ref mut io) = n.io else {
-                unreachable!()
-            };
-            io.rsrc2 = 3 << 1;
-            n.code[12..16].copy_from_slice(&0x1200_0000u32.to_le_bytes()); // descriptor offset in s9
-            let mut prefix = shift.to_le_bytes().to_vec();
-            if extra {
-                prefix.extend(0xbe8a_0302u32.to_le_bytes());
-            } // s10 = s2 is a second use
-            prefix.append(&mut n.code);
-            n.code = prefix;
-            let shader = emit_for(&n, Target::ANY).unwrap();
-            assert_eq!(
-                shader.direct_raw_indices,
-                if expected { vec![2] } else { Vec::new() }
-            );
+            for companion in [false, true] {
+                let mut n = native(RootType::ResourceHeap, companion);
+                n.layout.push(RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 2,
+                });
+                let StageIo::Cs(ref mut io) = n.io else {
+                    unreachable!()
+                };
+                io.rsrc2 = 3 << 1;
+                n.code[12..16].copy_from_slice(&0x1200_0000u32.to_le_bytes()); // descriptor offset in s9
+                let mut prefix = shift.to_le_bytes().to_vec();
+                if extra {
+                    prefix.extend(0xbe8a_0302u32.to_le_bytes());
+                } // s10 = s2 is a second use
+                prefix.append(&mut n.code);
+                n.code = prefix;
+                let shader = emit_for(&n, Target::ANY).unwrap();
+                assert_eq!(
+                    shader.direct_raw_indices,
+                    if expected && companion {
+                        vec![2]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                assert_eq!(
+                    shader.direct_scalar_indices,
+                    if expected && !companion {
+                        vec![2]
+                    } else {
+                        Vec::new()
+                    }
+                );
+            }
         }
     }
 

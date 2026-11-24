@@ -99,6 +99,8 @@ pub(crate) struct State {
     sample_cull: bool,
     #[cfg(feature = "diagnostics")]
     cull_inputs: Option<crate::capture::cull_indices::Inputs>,
+    /// Exact live-buffer generation, byte address and size of each staged CBV.
+    direct_cbvs: std::collections::HashMap<(usize, usize, u64, u32), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -535,6 +537,13 @@ impl State {
                             };
                             index
                         }
+                        None if compute && t.host.direct_scalar_indices.contains(&u.index) => {
+                            let selected = self.compute_constant(u.slot, u.dword);
+                            let Some(index) = self.direct_scalar_view(list, selected) else {
+                                return false;
+                            };
+                            index
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -838,9 +847,20 @@ impl State {
             *n
         };
         tracing::info!(hash, recording, ?values, "sampled compute root dwords");
-        for u in shader.user_data.iter().filter(|u| shader.direct_raw_indices.contains(&u.index)) {
+        for u in shader.user_data.iter().filter(|u| {
+            shader.direct_raw_indices.contains(&u.index) || shader.direct_scalar_indices.contains(&u.index)
+        }) {
             let selected = self.compute_constant(u.slot, u.dword);
-            let Some(&alias) = values.get(u.index as usize) else { continue };
+            let Some(&encoded) = values.get(u.index as usize) else { continue };
+            if shader.direct_scalar_indices.contains(&u.index) && encoded & victory_shader::emit::SCALAR_RAW_INDEX == 0 {
+                let range = self.direct_cbvs.iter()
+                    .find(|((h, _, _, _), slot)| *h == self.heaps[0] && **slot == encoded)
+                    .map(|((_, _, address, size), _)| (*address, *size));
+                tracing::info!(hash, recording, user_data=u.index, ?selected, alias=encoded, ?range,
+                    "sampled private direct constant buffer");
+                continue;
+            }
+            let alias = encoded & !victory_shader::emit::SCALAR_RAW_INDEX;
             let Some((&(_, window), _)) = self.raw_srv_views.iter()
                 .find(|((h,_), v)| *h == self.heaps[0] && **v == alias) else {continue};
             let range = window.map(|(_,a,n)|(a,n));
@@ -882,17 +902,99 @@ impl State {
 
     fn direct_raw_view(&mut self, list: &HostList, selected: Option<u32>) -> Option<u32> {
         let heap_id = self.heaps[0];
-        if heap_id == 0 { return None; }
+        if heap_id == 0 {
+            return None;
+        }
         let heap = crate::descriptor::heap(heap_id as This);
-        let window = selected.and_then(|value| {
+        let window = Self::selected_view(heap, selected)
+            .as_ref()
+            .and_then(crate::descriptor::host::direct_raw_window);
+        self.raw_view_slot(list, window).map(|(slot, _)| slot)
+    }
+
+    fn selected_view(heap: &crate::descriptor::Heap, selected: Option<u32>) -> Option<View> {
+        selected.and_then(|value| {
             // The native shader shifts a 32-bit index left by five, then
             // addresses a 32-byte view at the resulting byte offset.
             let index = value & (u32::MAX >> 5);
             let at = heap.start.checked_add(32 * u64::from(index))?;
-            if heap.index(at) != Some(index) { return None; }
-            crate::descriptor::view(at).as_ref().and_then(crate::descriptor::host::direct_raw_window)
-        });
-        self.raw_view_slot(list, window).map(|(slot, _)| slot)
+            if heap.index(at) != Some(index) {
+                return None;
+            }
+            crate::descriptor::view(at)
+        })
+    }
+
+    fn direct_scalar_view(&mut self, list: &HostList, selected: Option<u32>) -> Option<u32> {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        let host = heap.host()?;
+        let view = Self::selected_view(heap, selected);
+        if let Some(View::Constant(address, size)) = view {
+            if size == 0 || size > 65536 || !size.is_multiple_of(16) {
+                return None;
+            }
+            let len = u64::from(size);
+            let shadow = crate::shadow::find_named(address, 1);
+            if let Some(s) = &shadow {
+                if len > s.left(address) {
+                    return None;
+                }
+                // A native CBV may begin/end on a 16-byte boundary. A D3D12
+                // CBV rounds its extent up to 256 bytes. For a per-dword
+                // scalar read preserve the original range using a raw view.
+                if !s.gpu(address).is_multiple_of(256) || !len.is_multiple_of(256) {
+                    let window = crate::descriptor::host::named_raw_window(s.clone(), address, len)?;
+                    return self
+                        .raw_view_slot(list, Some(window))
+                        .map(|(slot, _)| slot | victory_shader::emit::SCALAR_RAW_INDEX);
+                }
+            }
+            if let Some(s) = &shadow {
+                list.buffer_access(&s.buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+            }
+            let generation = shadow
+                .as_ref()
+                .map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);
+            let key = (heap_id, generation, address, size);
+            if let Some(&slot) = self.direct_cbvs.get(&key) {
+                return Some(slot);
+            }
+            let gpu = if let Some(s) = shadow {
+                let gpu = s.gpu(address);
+                crate::shadow::refresh_named(list, &s, address, u64::from(size));
+                list.keep(&s.buffer);
+                gpu
+            } else {
+                if !crate::texture::committed(address as *const u8, size as usize) {
+                    return None;
+                }
+                let padded = size.next_multiple_of(256);
+                let (gpu, to) = list.scratch(u64::from(padded))?;
+                // SAFETY: scratch contains padded bytes. Clear the tail so
+                // host CBV alignment cannot expose adjacent guest data.
+                unsafe {
+                    to.add(size as usize)
+                        .write_bytes(0, (padded - size) as usize);
+                }
+                list.defer_fill(to, address as *const u8, size as usize);
+                gpu
+            };
+            let slot = host.dynamic(1)?;
+            host.constant_at(slot, gpu, size);
+            self.dynamic.push((heap_id, slot, 1));
+            self.direct_cbvs.insert(key, slot);
+            return Some(slot);
+        }
+        let window = match view.as_ref() {
+            Some(view) => Some(crate::descriptor::host::direct_scalar_window(view)?),
+            None => None,
+        };
+        self.raw_view_slot(list, window)
+            .map(|(slot, _)| slot | victory_shader::emit::SCALAR_RAW_INDEX)
     }
 
     fn raw_view_slot(
