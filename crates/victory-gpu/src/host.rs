@@ -1421,6 +1421,7 @@ struct CardWork {
     check: Vec<Prelude>,
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
+    hash: CardHash,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     /// One dword per piece compared, set where the piece differs: PC
@@ -1441,53 +1442,85 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
-/// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
-pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
-cbuffer Span : register(b0) {
-    uint first;    // the first piece
-    uint skew;     // where the copy starts in its piece 0
-    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
-    uint pieces;
-    uint out_at;   // the first piece's dword in `differs`, in bytes
-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
-};
-ByteAddressBuffer now : register(t0);
-// 16 bytes per piece of the copy: the hash of its bytes when they were
-// last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
-    uint lo = piece * 65536u;
-    lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
-    lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
-    [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+/// One 128-bit signature per piece in the original kernel, or one per
+/// lane with a whole 64-thread group assigned to a piece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardHash {
+    Serial,
+    Cooperative,
+}
+
+impl CardHash {
+    pub(crate) fn selected() -> Self {
+        static MODE: std::sync::OnceLock<CardHash> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            if std::env::var_os("VICTORY_CARD_PARALLEL_HASH").is_some_and(|value| value == "1") {
+                Self::Cooperative
+            } else {
+                Self::Serial
+            }
+        })
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+
+    pub(crate) fn source(self) -> &'static str {
+        match self {
+            Self::Serial => include_str!("host/card_compare.hlsl"),
+            Self::Cooperative => concat!(
+                "#define COOPERATIVE 1\n",
+                include_str!("host/card_compare.hlsl")
+            ),
+        }
+    }
+
+    pub(crate) fn signature_bytes(self, pieces: u64) -> u64 {
+        pieces
+            * 16
+            * match self {
+                Self::Serial => 1,
+                Self::Cooperative => 64,
+            }
+    }
+
+    pub(crate) fn groups(self, pieces: u32) -> u32 {
+        match self {
+            Self::Serial => pieces.div_ceil(64),
+            Self::Cooperative => pieces,
+        }
     }
 }
-"#;
+
+/// One bounded set of actual write spans every 64 frames for GPU timing replay.
+#[cfg(feature = "diagnostics")]
+fn trace_card_hash_spans(size: u64, runs: &[crate::shadow::CardSpan]) {
+    use std::fmt::Write;
+    static START: OnceLock<Option<u64>> = OnceLock::new();
+    let Some(start) = START.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_CARD_HASH_FROM_FRAME")
+            .ok()?
+            .parse()
+            .ok()
+    }) else {
+        return;
+    };
+    let frame = crate::frame::current();
+    if frame < *start || !(8..=2048).contains(&runs.len()) || size > 128 << 20 {
+        return;
+    }
+    let sample = (frame - start) / 64;
+    if sample >= 32 {
+        return;
+    }
+    static SAMPLES: AtomicU32 = AtomicU32::new(0);
+    let bit = 1 << sample;
+    if SAMPLES.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    let mut line = format!("v1,{},{size}", runs[0].skew);
+    for run in runs {
+        let _ = write!(line, ",{}:{}", run.first, run.pieces);
+    }
+    tracing::info!("card hash spans frame={frame} CARD_HASH_SPANS={line}");
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2905,13 +2938,15 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let hash = CardHash::selected();
+        let source = hash.source();
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -2944,6 +2979,7 @@ impl Host {
                 ..Default::default()
             })?;
             Ok(CardWork {
+                hash,
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
@@ -3048,7 +3084,7 @@ impl Host {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
+                        // 399 MB in run 75): `before` holds the signatures
                         // of each 64 KiB piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
@@ -3072,12 +3108,14 @@ impl Host {
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        #[cfg(feature = "diagnostics")]
+                        trace_card_hash_spans(size, &runs);
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(work.hash.groups(run.pieces), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3162,7 +3200,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(work.hash.groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5686,8 +5724,8 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes, hash {:?}",
+                    if rehash_runs() { "on" } else { "off" }, CardHash::selected()
                 );
             }
         }
