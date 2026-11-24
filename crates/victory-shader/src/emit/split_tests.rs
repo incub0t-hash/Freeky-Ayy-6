@@ -1005,6 +1005,43 @@ fn selects_on_masks_held_as_numbers() {
     }
 }
 
+#[test]
+fn numeric_selects_beside_in_half_reads() {
+    let mut body = IN_HALF.to_vec();
+    body.extend([
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_03C1, // s_mov_b32 s11, -1
+    ]);
+    let select = body.len();
+    body.extend([
+        0xD501_0001,
+        0x0029_0F02, // v_cndmask_b32 v1, v2, 7, s[10:11] (unused)
+    ]);
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let unused = program(&body, 128);
+    let shader = emit_for(&unused, wave32).unwrap();
+    assert_eq!(wave_size(&shader.dxil), Some(32));
+    program_case(
+        "unused numeric select beside in-half reads",
+        &unused,
+        |t| t ^ 31,
+        true,
+    );
+
+    body[select] = 0xD501_0002; // write v2, the stored result
+    let used = program(&body, 64);
+    assert!(emit_for(&used, wave32).is_ok());
+    program_case(
+        "used numeric select beside in-half reads",
+        &used,
+        |t| if t < 32 { t ^ 31 } else { 7 },
+        true,
+    );
+}
+
 /// A lane read inside a divergent branch in a program that also has a
 /// whole-wave section: the lane read takes the console flow on every host,
 /// and the section is lowered there as it is elsewhere. Lanes below 20
@@ -1062,4 +1099,48 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
             .to_string();
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
+}
+
+/// `s_*_saveexec` writes the old EXEC to its scalar destination and the new
+/// EXEC to EXEC, and sets SCC to whether the *new* EXEC is non-zero. In
+/// console flow, `s_cbranch_scc0` after `s_and_saveexec_b64` must branch on
+/// the new EXEC (0 here), not the saved old EXEC (all lanes active).
+#[test]
+fn saveexec_scc_tests_new_exec_not_saved_exec() {
+    let body = [
+        0xBE89_03AA, // s_mov_b32 s9, 42
+        0x7D88_0080, // v_cmp_gt_u32 vcc, 0, v0 (false in every lane)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc (old != 0, new == 0 -> SCC = 0)
+        0xBF84_0003, // s_cbranch_scc0 +3 (must skip the body)
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0xBE89_03BC, // s_mov_b32 s9, 60 (must not run)
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("saveexec SCC tests new EXEC", &body, 64, |_| 42);
+}
+
+/// A loop that runs while `s_and_saveexec` leaves a lane: SCC is the new
+/// EXEC, so the wave leaves when its last lane does. Lane t stays for t + 1
+/// iterations and s9 counts the wave's: 64. Branching on the saved EXEC
+/// ran the loop once more, with no lane in it.
+#[test]
+fn loops_leave_on_the_new_exec_of_saveexec() {
+    let body = [
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0x8009_8109, // s_add_u32 s9, s9, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF85_FFFB, // s_cbranch_scc1 loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("a loop leaving on saveexec's SCC", &body, 64, |_| 64);
 }
