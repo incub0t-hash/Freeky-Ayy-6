@@ -814,7 +814,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        // The renderer can guard a destination again after kernel_will_write.
+        // ReadFile cannot invoke that guard's fault handler. Read into our
+        // own buffer first, then let CPU stores handle a guard installed
+        // between opening the title range and copying into it.
+        let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+        return into_destination(request, size, |out| {
+            out.copy_from_slice(&source);
+            Ok(size)
+        })
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -1206,6 +1214,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn a_short_raw_file_read_does_not_publish_partial_destination_bytes() {
+        let (_dir, file) = file_with(b"partial");
+        let mut destination = [0xa5; 16];
+        let r = request(0, destination.as_mut_ptr().cast(), 16, file, 0, 16);
+        assert_eq!(execute(&r), Err(END_OF_FILE));
+        assert_eq!(destination, [0xa5; 16]);
     }
 
     #[test]
