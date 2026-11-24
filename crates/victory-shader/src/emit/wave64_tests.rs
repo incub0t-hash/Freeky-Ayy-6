@@ -476,9 +476,18 @@ mod gpu {
         expected: &[u32],
         expect_native_fail: bool,
     ) {
+        let require_hardware =
+            std::env::var("VICTORY_REQUIRE_HARDWARE_TESTS")
+                .ok().as_deref() == Some("1");
+
+        let mut hardware_wave32 = false;
+
         with_hosts(|hosts| {
             for (warp_idx, host) in hosts.iter().enumerate() {
                 let Some(host) = host else {
+                    println!(
+                        "{name}: adapter {warp_idx} unavailable"
+                    );
                     continue;
                 };
                 let warp = warp_idx == 1;
@@ -522,9 +531,23 @@ mod gpu {
                         expected,
                         "{name} ({mode:?}, warp={warp}) output mismatch"
                     );
+
+                    println!(
+                        "VERIFIED {name}: mode={mode:?}, warp={warp}, {} dwords",
+                        expected.len()
+                    );
+
+                    if !warp && matches!(mode, Wave64Mode::Wave32) {
+                        hardware_wave32 = true;
+                    }
                 }
             }
         });
+
+        assert!(
+            !require_hardware || hardware_wave32,
+            "{name}: required hardware Wave32 dispatch did not execute"
+        );
     }
 
     #[test]
