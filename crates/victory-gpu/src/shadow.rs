@@ -416,7 +416,11 @@ fn find_range(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> 
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return allow_loose.then(|| loose(address, end)).flatten();
+        return if allow_loose {
+            loose(address, end)
+        } else {
+            None
+        };
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -443,6 +447,27 @@ fn find_range(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> 
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
     entry.shadow.clone()
+}
+
+/// Refresh only the same registered generation that recording selected.
+/// Holding the registry lock prevents its backing from being released while
+/// copying. A later allocation at the same address has another Shadow.
+pub(crate) fn refresh_named(list: &HostList, shadow: &Arc<Shadow>, address: u64, len: u64) {
+    let shadow = shadow.clone();
+    list.defer_host(move || {
+        let map = buffers();
+        let live = map
+            .range((shadow.start, 0)..=(shadow.start, usize::MAX))
+            .any(|(_, entry)| {
+                entry
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(s, &shadow))
+            });
+        if live {
+            shadow.update(address as usize, len as usize);
+        }
+    });
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

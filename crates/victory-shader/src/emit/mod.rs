@@ -78,6 +78,7 @@
 //!   console never exports them).
 
 mod bitcode;
+mod scalar_srvs;
 mod gather_lod;
 mod container;
 #[cfg(all(test, windows))]
@@ -158,6 +159,9 @@ pub struct HostShader {
     /// A split-wave record initializer may dispatch only when this root
     /// constant is present and its byte stride is a multiple of 16.
     pub record_stride: Option<UserData>,
+    /// Fixed compute SRV table entries accessed only with scalar byte loads.
+    /// Each pair is (root parameter slot, dword offset of the view in the table).
+    pub scalar_raw_srvs: Vec<(u8, u32)>,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -404,6 +408,7 @@ pub fn emit(
         stage: native.stage,
         mesh_wave32_compatible: l.mesh_lane_independent,
         record_stride: l.record_stride,
+        scalar_raw_srvs: scalar_srvs::entries(native, p, res),
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -676,6 +681,7 @@ mod tests {
             stage: crate::HwStage::Ps,
             mesh_wave32_compatible: false,
             record_stride: None,
+            scalar_raw_srvs: Vec::new(),
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -689,6 +695,7 @@ mod tests {
                 stage,
                 mesh_wave32_compatible: false,
                 record_stride: None,
+                scalar_raw_srvs: Vec::new(),
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),

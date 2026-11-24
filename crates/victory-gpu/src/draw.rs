@@ -504,7 +504,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute, &t.host.scalar_raw_srvs);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -791,6 +791,9 @@ impl State {
             *n
         };
         tracing::info!(hash, recording, ?values, "sampled compute root dwords");
+        for &heap in self.heaps.iter().filter(|&&heap| heap != 0) {
+            crate::descriptor::heap(heap as This).trace_direct_views(hash, recording);
+        }
         for u in used.iter().filter(|u| u.root == RootType::Table) {
             let Some(&Root::Table(table)) = self.compute.get(usize::from(u.slot)) else {
                 tracing::info!(hash, recording, slot = u.slot, "sampled compute table missing");
@@ -845,7 +848,13 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        scalar_raw_srvs: &[(u8, u32)],
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -863,14 +872,21 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(end) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else {
+                self.table_failed = true;
+                return Vec::new();
+            };
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            let raw = scalar_raw_srvs.contains(&(u.slot, u.table_offset_dwords))
+                && crate::descriptor::view(end)
+                    .as_ref()
+                    .is_some_and(crate::descriptor::host::scalar_structured_view);
+            if index >= host.count() || raw {
                 fresh.push(u.slot);
             }
         }
@@ -902,10 +918,31 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            // Validate the full descriptor range before reading its records.
+            let last = table.checked_add(u64::from(n - 1) * 32 + 31);
+            if last.and_then(|at| heap.index(at)).is_none() {
+                self.table_failed = true;
+                continue;
+            }
+            let mut windows = Vec::new();
+            for u in entries.iter().filter(|u| {
+                scalar_raw_srvs.contains(&(u.slot, u.table_offset_dwords))
+            }) {
+                let k = u.table_offset_dwords / 8;
+                let at = table + u64::from(k) * 32;
+                if let Some(view) = crate::descriptor::view(at)
+                    && crate::descriptor::host::scalar_structured_view(&view)
+                {
+                    windows.push((k, crate::descriptor::host::scalar_window(&view, u.stride)));
+                }
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                for (k, window) in &windows {
+                    (k, window.as_ref().map(|w| w.generation())).hash(&mut h);
+                }
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
@@ -915,6 +952,13 @@ impl State {
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let k = u.table_offset_dwords / 8;
+                    if let Some((_, window)) = windows.iter().find(|(at, _)| *at == k) {
+                        if let Some(w) = window {
+                            w.refresh(list);
+                        }
+                        continue;
+                    }
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
@@ -939,6 +983,12 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                if let Some((_, window)) = windows.iter().find(|(at, _)| *at == k) {
+                    if !window.as_ref().is_some_and(|w| w.bind(list, host, index)) {
+                        host.null_scalar_buffer(index);
+                    }
+                    continue;
+                }
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
