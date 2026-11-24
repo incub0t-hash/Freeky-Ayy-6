@@ -282,7 +282,16 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            {
+                let selected = crate::capture::scene_depth(texture);
+                crate::capture::note_target(record.resource);
+                // The DSV can select this very frame for capture, after its RTVs were bound.
+                if selected {
+                    for &target in &self.targets {
+                        crate::capture::note_target(target as This);
+                    }
+                }
+            }
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.

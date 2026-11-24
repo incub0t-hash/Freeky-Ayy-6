@@ -20,6 +20,34 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 
 /// Presentation count at the first bind of the requested shader.
 static FIRST_BIND_PRESENT: AtomicU64 = AtomicU64::new(u64::MAX);
+static SCENE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Capture a real scene depth binding after the initial pipeline build has drained.
+pub(crate) fn scene_depth(texture: &ID3D12Resource) -> bool {
+    static SIZE: OnceLock<Option<(u64, u32)>> = OnceLock::new();
+    if !dump_on() || SCENE_FRAME.load(Ordering::Relaxed) != u64::MAX {
+        return false;
+    }
+    let Some((width, height)) = *SIZE.get_or_init(|| {
+        let raw = std::env::var("VICTORY_CAPTURE_SCENE_DEPTH").ok()?;
+        let (w, h) = raw.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    }) else { return false };
+    let frame = crate::queue::presented() + 1;
+    if frame.saturating_sub(FIRST_BIND_PRESENT.load(Ordering::Relaxed)) < 32
+        || crate::pipeline::making() != 0 {
+        return false;
+    }
+    // SAFETY: the caller has resolved the DSV and its live host resource.
+    let desc = unsafe { texture.GetDesc() };
+    if desc.Width == width && desc.Height == height
+        && SCENE_FRAME.compare_exchange(u64::MAX, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        tracing::info!(frame, width, height, "capture scene depth bound after pipeline compilation");
+        return true;
+    }
+    false
+}
 
 pub(crate) fn first_bind(hash: &str) {
     static SHADER: OnceLock<Option<String>> = OnceLock::new();
@@ -36,6 +64,9 @@ pub(crate) fn first_bind(hash: &str) {
 
 /// Capture explicitly listed frames and offsets relative to the first bind.
 pub(crate) fn listed(n: u64) -> bool {
+    if n == SCENE_FRAME.load(Ordering::Relaxed) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
