@@ -277,12 +277,101 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+/// Reads the required wave-lane range `(min, max)` from an emitted DXIL
+/// container's `PSV0` runtime info (`MinimumExpectedWaveLaneCount` and
+/// `MaximumExpectedWaveLaneCount`). Returns `None` when unconstrained
+/// (`min == 0` and `max == u32::MAX` or `0`) or absent.
+fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    if psv.len() < 28 {
+        return None;
+    }
+    let info_size = u32::from_le_bytes(psv[0..4].try_into().ok()?);
+    if info_size < 24 {
+        return None;
+    }
+    let min = u32::from_le_bytes(psv[20..24].try_into().ok()?);
+    let max = u32::from_le_bytes(psv[24..28].try_into().ok()?);
+    if min == 0 && (max == 0 || max == u32::MAX) {
+        return None;
+    }
+    Some((min.max(1), if max == 0 { u32::MAX } else { max }))
+}
+
+/// Whether a translated `stage` program cannot run on a host whose waves have
+/// `host_lanes = (min, max)` lanes.
+///
+/// - If the emitted DXIL module declares a `PSV0` wave-lane range (e.g.
+///   `WaveSize(64)` or `WaveSize(32)`), it is refused whenever the host's
+///   `[min, max]` range does not overlap it (and on `< 64`-lane hosts, a
+///   console `wave64` mesh/compute shader is only allowed when `PSV0`
+///   explicitly bounds `req_max <= host_max`, such as split `WaveSize(32)`
+///   emulation).
+/// - Console `wave64` mesh and compute programs whose emitted DXIL declares no
+///   `PSV0` wave-lane range are refused whenever `host_lanes.1 < 64`: some
+///   console `wave64` compute programs still assume 64-lane wave semantics
+///   even without `WaveSize(64)` metadata and hang 32-lane hosts.
+/// - Wave32 compute and vertex/pixel programs run per lane and are kept unless
+///   their emitted DXIL explicitly requires an unsupported wave size.
+fn wave_lanes_unsupported(
+    stage: &str,
+    console_wave64: bool,
+    emitted_wave: Option<(u32, u32)>,
+    (host_min, host_max): (u32, u32),
+) -> bool {
+    let wave64_stage = matches!(stage, "mesh" | "compute") && console_wave64;
+    if let Some((req_min, req_max)) = emitted_wave {
+        if host_max < req_min || host_min > req_max {
+            return true;
+        }
+        return wave64_stage && host_max < 64 && req_max > host_max;
+    }
+    wave64_stage && host_max < 64
+}
+
+/// Returns a human-readable refusal reason when [`wave_lanes_unsupported`]
+/// holds: reports the emitted `PSV0` and host wave-lane ranges when `PSV0`
+/// provides them, and retains the console 64-lane message when `PSV0` is `None`.
+fn wave_lanes_refusal(
+    stage: &str,
+    console_wave64: bool,
+    emitted_wave: Option<(u32, u32)>,
+    host_lanes: (u32, u32),
+) -> Option<std::borrow::Cow<'static, str>> {
+    if !wave_lanes_unsupported(stage, console_wave64, emitted_wave, host_lanes) {
+        return None;
+    }
+    if let Some((req_min, req_max)) = emitted_wave {
+        let (host_min, host_max) = host_lanes;
+        return Some(
+            format!(
+                "a {stage} shader declaring PSV0 wave lanes [{req_min}, {req_max}] on a host supporting [{host_min}, {host_max}]"
+            )
+            .into(),
+        );
+    }
+    Some(
+        match (stage, host_lanes.1 < 32) {
+            ("mesh", true) => {
+                "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
+            }
+            ("mesh", false) => "a mesh program written for 64-lane waves, on a host without them",
+            (_, true) => {
+                "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
+            }
+            (_, false) => "a shader requiring 64-lane waves, on a host without them",
+        }
+        .into(),
+    )
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+fn refuse(reason: &str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
+    if !seen.iter().any(|s| s == reason) {
+        seen.push(reason.to_owned());
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
@@ -323,8 +412,18 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        let host_lanes = host()?.wave_lanes();
+        if let Some(ms) = mesh
+            && let Some(reason) = wave_lanes_refusal(ms.stage, ms.wave64(), None, host_lanes)
+        {
+            return refuse(&reason, shaders);
+        }
         for (s, _) in &stages {
-            s.translated()?;
+            let t = s.translated()?;
+            let emitted = dxil_wave_lanes(&t.host.dxil);
+            if let Some(reason) = wave_lanes_refusal(s.stage, s.wave64(), emitted, host_lanes) {
+                return refuse(&reason, shaders);
+            }
         }
         let host = host()?;
 
@@ -663,5 +762,142 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dxil_wave_lanes, wave_lanes_refusal, wave_lanes_unsupported};
+
+    fn synthetic_dxbc_with_psv0(min_lanes: u32, max_lanes: u32) -> Vec<u8> {
+        let mut psv = Vec::new();
+        psv.extend_from_slice(&48u32.to_le_bytes()); // PSVRuntimeInfo2 size
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min_lanes.to_le_bytes());
+        info[20..24].copy_from_slice(&max_lanes.to_le_bytes());
+        psv.extend_from_slice(&info);
+
+        // DXBC header (32 bytes) + 1 part offset (4 bytes) + part header (8 bytes) + psv.
+        let part_offset = 36u32;
+        let total_size = part_offset + 8 + psv.len() as u32;
+        let mut out = Vec::with_capacity(total_size as usize);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0u8; 16]); // digest
+        out.extend_from_slice(&1u32.to_le_bytes()); // version
+        out.extend_from_slice(&total_size.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // part count
+        out.extend_from_slice(&part_offset.to_le_bytes());
+        out.extend_from_slice(b"PSV0");
+        out.extend_from_slice(&(psv.len() as u32).to_le_bytes());
+        out.extend_from_slice(&psv);
+        out
+    }
+
+    #[test]
+    fn emitted_wave_size_checked_against_host_range() {
+        // Compute declaring WaveSize(64) is refused on 32-lane NVIDIA and 4-lane WARP,
+        // and allowed on 64-lane hosts.
+        assert!(wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((64, 64)),
+            (32, 32)
+        ));
+        assert!(wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((64, 64)),
+            (4, 4)
+        ));
+        assert!(!wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((64, 64)),
+            (32, 64)
+        ));
+
+        // Wave64 compute lowered to WaveSize(32) (e.g. split emulation) runs on
+        // 32-lane and 32..=64-lane hosts, and is still refused on 4-lane WARP.
+        assert!(!wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 32)),
+            (32, 32)
+        ));
+        assert!(!wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 32)),
+            (32, 64)
+        ));
+        assert!(wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 32)),
+            (4, 4)
+        ));
+
+        // Console wave64 compute with no PSV0 wave-lane range (or an upper
+        // bound wider than the host) is refused on <64-lane hosts, and allowed
+        // on 64-lane hosts; console wave32 compute without PSV0 runs everywhere.
+        assert!(wave_lanes_unsupported("compute", true, None, (32, 32)));
+        assert!(wave_lanes_unsupported("compute", true, None, (4, 4)));
+        assert!(wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 64)),
+            (32, 32)
+        ));
+        assert!(!wave_lanes_unsupported("compute", true, None, (32, 64)));
+        assert!(!wave_lanes_unsupported("compute", true, None, (64, 64)));
+        assert!(!wave_lanes_unsupported("compute", false, None, (32, 32)));
+        assert!(!wave_lanes_unsupported("compute", false, None, (4, 4)));
+
+        // Console wave64 mesh has no PSV0 WaveSize metadata and still needs 64-lane hosts.
+        assert!(wave_lanes_unsupported("mesh", true, None, (32, 32)));
+        assert!(wave_lanes_unsupported("mesh", true, None, (4, 4)));
+        assert!(!wave_lanes_unsupported("mesh", true, None, (32, 64)));
+        assert!(!wave_lanes_unsupported("mesh", false, None, (32, 32)));
+
+        // Vertex and pixel programs run per lane.
+        assert!(!wave_lanes_unsupported("vertex", true, None, (32, 32)));
+        assert!(!wave_lanes_unsupported("pixel", true, None, (4, 4)));
+    }
+
+    #[test]
+    fn wave_lanes_refusal_reports_emitted_and_host_ranges() {
+        let wave32_on_64 =
+            wave_lanes_refusal("compute", true, Some((32, 32)), (64, 64)).expect("refused");
+        assert!(wave32_on_64.contains("[32, 32]"));
+        assert!(wave32_on_64.contains("[64, 64]"));
+        assert!(!wave32_on_64.contains("64-lane waves"));
+
+        let wave64_on_32 =
+            wave_lanes_refusal("compute", true, Some((64, 64)), (32, 32)).expect("refused");
+        assert!(wave64_on_32.contains("[64, 64]"));
+        assert!(wave64_on_32.contains("[32, 32]"));
+        assert!(!wave64_on_32.contains("64-lane waves"));
+
+        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32)).expect("refused");
+        assert_eq!(
+            unsized_on_32,
+            "a shader requiring 64-lane waves, on a host without them"
+        );
+    }
+
+    #[test]
+    fn dxil_wave_lanes_reads_psv0_bounds() {
+        assert_eq!(
+            dxil_wave_lanes(&synthetic_dxbc_with_psv0(0, u32::MAX)),
+            None
+        );
+        assert_eq!(
+            dxil_wave_lanes(&synthetic_dxbc_with_psv0(64, 64)),
+            Some((64, 64))
+        );
+        assert_eq!(
+            dxil_wave_lanes(&synthetic_dxbc_with_psv0(32, 32)),
+            Some((32, 32))
+        );
     }
 }
