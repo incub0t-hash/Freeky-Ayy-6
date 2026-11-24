@@ -357,6 +357,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        if barriers.iter().any(|b| b.kind == 1) {
+            list.forget_packed_owner();
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -442,21 +445,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
-        ) {
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
-            }
-            ensure_state(list, dst, COPY_DEST);
-            ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
-        } else if let (Some((to, a)), Some((from, b))) = (
+        if !copy_host_texture(list, dst, src)
+            && let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
@@ -465,6 +455,41 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+#[cfg(windows)]
+pub(crate) fn copy_host_texture(list: &crate::host::HostList, dst: This, src: This) -> bool {
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(dst),
+        crate::resource::host_resource(src),
+    ) else { return false };
+    if crate::texture::title_written(from) {
+        crate::texture::upload(list, src, from);
+    }
+    ensure_state(list, dst, COPY_DEST);
+    ensure_state(list, src, COPY_SOURCE);
+    crate::texture::host_written(dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+    // SAFETY: an open list and live textures.
+    unsafe { list.list.CopyResource(to, from) };
+    // Record proof only for the full-resource copy, never a state transition,
+    // an indirect dispatch which may do no work, or a partial region copy.
+    if let Some((_, desc)) = crate::resource::texture_memory(dst)
+        && desc.is_packed_producer()
+        && dst != src
+        // SAFETY: both host textures remain live while recording the copy.
+        && unsafe {
+            let (a, b) = (from.GetDesc(), to.GetDesc());
+            a.Format == b.Format && a.Dimension == b.Dimension && a.Width == b.Width
+                && a.Height == b.Height && a.DepthOrArraySize == b.DepthOrArraySize
+                && a.MipLevels == b.MipLevels && a.SampleDesc == b.SampleDesc
+        }
+        && let Some(copy) = crate::resource::host_copy(dst)
+    {
+        list.completed_packed_copy(&copy);
+    }
+    true
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {

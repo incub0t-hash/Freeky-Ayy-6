@@ -319,6 +319,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The host texture most recently fully overwritten on this very list.
+    /// A possible competing write or a guest-memory operation drops the proof.
+    packed_owner: std::sync::atomic::AtomicUsize,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -356,6 +359,10 @@ struct TextureUse {
     writes: u64,
     /// Writer identity and revision last copied into this texture.
     packed_from: Option<(usize, u64)>,
+}
+
+fn writable_state(state: u32) -> bool {
+    state & (0x4 | 0x8 | 0x10 | 0x400 | 0x1000) != 0
 }
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -593,6 +600,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                packed_owner: 0.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1044,6 +1052,12 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        if writable_state(wanted) {
+            let owner = self.packed_owner.load(Ordering::Relaxed);
+            if owner != 0 && owner != std::sync::Arc::as_ptr(&copy) as usize {
+                self.forget_packed_owner();
+            }
+        }
         self.transition_copy(&copy, wanted)
             .map(|before| (texture, before))
     }
@@ -1063,12 +1077,24 @@ impl HostList {
                 writes: 0,
                 packed_from: None,
             });
-        if wanted & (0x4 | 0x8 | 0x10 | 0x400 | 0x1000) != 0 {
+        if writable_state(wanted) {
             state.writes += 1;
             state.packed_from = None;
         }
         let before = std::mem::replace(&mut state.last, wanted);
         (before != wanted).then_some(before)
+    }
+
+    pub(crate) fn completed_packed_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
+        self.packed_owner.store(std::sync::Arc::as_ptr(copy) as usize, Ordering::Relaxed);
+    }
+
+    pub(crate) fn owns_packed_contents(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> bool {
+        self.packed_owner.load(Ordering::Relaxed) == std::sync::Arc::as_ptr(copy) as usize
+    }
+
+    pub(crate) fn forget_packed_owner(&self) {
+        self.packed_owner.store(0, Ordering::Relaxed);
     }
 
     /// Copies all mips and slices of a format-compatible packed-light alias.
@@ -1204,6 +1230,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.forget_packed_owner();
         let mut deferred = self.deferred();
         deferred
             .copies
@@ -1245,6 +1272,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.forget_packed_owner();
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -1252,6 +1280,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        self.forget_packed_owner();
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -1333,9 +1362,16 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// A packed copy supersedes an earlier upload. A later CPU-owned read
+    /// must record another staging copy even if this list uploaded it before.
+    pub(crate) fn packed_view_changed(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.forget_packed_owner();
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
     }

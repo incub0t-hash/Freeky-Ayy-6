@@ -79,9 +79,11 @@ fn packed_view_requires_one_live_writer_and_matching_shape_and_tiles() {
     let beside = image(address + 4, &sample);
     assert!(packed_writer(beside).is_none());
     resource_release(beside);
-    let overlap = image(address, &desc);
-    assert!(packed_writer(view).is_none());
-    resource_release(overlap);
+    for start in [address - 4, address, address + 4] {
+        let overlap = image(start, &desc);
+        assert!(packed_writer(view).is_none(), "overlap at {start:#x}");
+        resource_release(overlap);
+    }
     assert!(packed_writer(view).is_some());
     resource_release(src);
     assert!(packed_writer(view).is_none());
@@ -228,6 +230,8 @@ fn verify_shape(desc: ResourceDesc) {
     let backing = vec![0u8; 65536];
     let address = backing.as_ptr() as usize;
     let src = image(address, &desc);
+    let temp_memory = vec![0u8; 65536];
+    let temp = image(temp_memory.as_ptr() as usize, &desc);
     let dst = image(address, &sample_desc(desc));
     let count = u32::from(desc.mip_levels)
         * if desc.dimension == TEXTURE_3D {
@@ -249,7 +253,8 @@ fn verify_shape(desc: ResourceDesc) {
         });
         let list = if pass == 0 { &producer } else { &consumer };
         list.keep(&staging);
-        upload(list, src, &staging, &src_fps);
+        upload(list, temp, &staging, &src_fps);
+        assert!(crate::list::copy_host_texture(&consumer, src, temp));
         assert!(copy_packed_view(&consumer, dst));
         crate::list::ensure_state(&consumer, dst, 0xc0);
         assert!(copy_packed_view(&consumer, dst));
@@ -268,6 +273,7 @@ fn verify_shape(desc: ResourceDesc) {
     consumer.close();
     resource_release(src);
     resource_release(dst);
+    resource_release(temp);
     host.execute(&[&producer, &consumer]);
     let mut words = 0;
     for (pass, back) in readbacks.iter().enumerate() {
@@ -283,6 +289,70 @@ fn verify_shape(desc: ResourceDesc) {
         unsafe { back.Unmap(0, Some(&D3D12_RANGE::default())) };
     }
     eprintln!("R32_UINT to RGB9E5: {count} subresources, {words} packed texels across two writes");
+}
+
+#[test]
+fn packed_view_cpu_refresh_wins_after_an_intervening_guest_write() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let mut backing = vec![0x5au8; 65536];
+    let update = vec![0x2du8; backing.len()];
+    let temp_memory = vec![0u8; backing.len()];
+    let desc = ResourceDesc {
+        mip_levels: 1,
+        depth_or_array_size: 1,
+        ..layers()
+    };
+    let src = image(backing.as_ptr() as usize, &desc);
+    let view = image(backing.as_ptr() as usize, &sample_desc(desc));
+    let temp = image(temp_memory.as_ptr() as usize, &desc);
+    let completed = host.new_list().unwrap();
+    let recorded = host.new_list().unwrap();
+    let list = host.new_list().unwrap();
+    assert!(
+        !copy_packed_view(&list, view),
+        "allocated but never written"
+    );
+    assert!(crate::list::copy_host_texture(&completed, src, temp));
+    completed.close();
+    host.execute(&[&completed]);
+    assert!(crate::list::copy_host_texture(&recorded, src, temp));
+    assert!(
+        !copy_packed_view(&list, view),
+        "neither an older submission nor an unsubmitted list owns this read"
+    );
+    crate::list::ensure_state(&list, src, 0x8);
+    assert!(
+        !copy_packed_view(&list, view),
+        "a UAV transition alone writes nothing"
+    );
+    let dst = host_resource(view).unwrap();
+    crate::texture::upload(&list, view, dst);
+    assert!(crate::list::copy_host_texture(&list, src, temp));
+    assert!(copy_packed_view(&list, view));
+    list.defer_copy(backing.as_mut_ptr(), update.as_ptr(), update.len());
+    assert!(!copy_packed_view(&list, view));
+    crate::texture::upload(&list, view, dst);
+    crate::list::ensure_state(&list, view, 0x800);
+    let (fps, bytes) = footprints(host, view, 1);
+    let (shape, _) = host.upload_buffer(bytes).unwrap();
+    // SAFETY: upload and readback buffers have the same size.
+    let back = read_buffer(host, &unsafe { shape.GetDesc() });
+    let (to, from) = (footprint(&back, fps[0]), location(dst, 0));
+    unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    list.close();
+    host.execute(&[&list]);
+    let mut mapped = std::ptr::null_mut();
+    unsafe { back.Map(0, None, Some(&mut mapped)).unwrap() };
+    each_word(&fps, 0, |at, _| {
+        let got = unsafe { mapped.cast::<u8>().add(at).cast::<u32>().read_unaligned() };
+        assert_eq!(got, 0x2d2d2d2d, "final CPU update at {at}");
+    });
+    unsafe { back.Unmap(0, Some(&D3D12_RANGE::default())) };
+    resource_release(src);
+    resource_release(temp);
+    resource_release(view);
 }
 
 #[test]

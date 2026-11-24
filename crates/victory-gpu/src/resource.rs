@@ -98,6 +98,13 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+#[cfg(windows)]
+impl ResourceDesc {
+    pub(crate) fn is_packed_producer(&self) -> bool {
+        self.format == 42 && self.flags & 4 != 0
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo {
@@ -956,15 +963,17 @@ fn hand_out_resource(
         let id = std::ptr::from_ref::<Resource>(&resource) as usize;
         // Validate the complete guest extent once, including the mip tail
         // and every slice. An unsupported layout cannot establish an alias.
+        let layout = texture_layout(&desc);
+        let end = layout.as_ref().and_then(|t| address.checked_add(t.size.try_into().ok()?));
         let producer = resource.host.as_ref().filter(|_| {
-            desc.format == 42 && desc.flags & 4 != 0
-                && texture_layout(&desc).is_some_and(|t| t.size != 0
-                    && (address as u64).checked_add(t.size).is_some())
+            desc.is_packed_producer() && end.is_some_and(|e| e > address)
         }).map(std::sync::Arc::downgrade);
+        let end = end.or_else(|| address.checked_add(footprint(&desc)?.size.try_into().ok()?))
+            .unwrap_or(usize::MAX);
         TEXTURE_WRITERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((address, id), (desc, producer));
+            .insert((address, id), (desc, end, producer));
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1176,7 +1185,7 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 #[cfg(windows)]
 type TextureWriters = std::collections::BTreeMap<
     (usize, usize),
-    (ResourceDesc, Option<std::sync::Weak<HostTexture>>),
+    (ResourceDesc, usize, Option<std::sync::Weak<HostTexture>>),
 >;
 #[cfg(windows)]
 static TEXTURE_WRITERS: std::sync::Mutex<TextureWriters> =
@@ -1195,20 +1204,23 @@ fn packed_writer(view: This) -> Option<std::sync::Arc<HostTexture>> {
     let writers = TEXTURE_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
     let mut found = writers.range((address, 0)..=(address, usize::MAX));
     let candidate = found.next();
-    let ambiguous = found.next().is_some();
+    let ambiguous = candidate.is_some_and(|(key, (_, end, _))| {
+        found.next().is_some() || writers.range(..(*end, 0)).any(|(other, (_, last, _))| {
+            other != key && *last > address
+        })
+    });
     #[cfg(feature = "diagnostics")]
     {
         static LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 16 || n.is_power_of_two() {
-            tracing::info!(n, address = ?dst.data(), view = ?dst.desc, writer = ?candidate.map(|(_, (d, _))| d),
+            tracing::info!(n, address = ?dst.data(), view = ?dst.desc, writer = ?candidate.map(|(_, (d, _, _))| d),
                 ambiguous, "placed RGB9E5 writer lookup");
         }
     }
-    let (_, (src, host)) = candidate?;
+    let (_, (src, _, host)) = candidate?;
     if ambiguous
-        || src.format != 42
-        || src.flags & 4 == 0
+        || !src.is_packed_producer()
         || src.dimension != dst.desc.dimension
         || src.width != dst.desc.width
         || src.height != dst.desc.height
@@ -1237,7 +1249,15 @@ pub(crate) fn copy_packed_view(list: &crate::host::HostList, view: This) -> bool
     let Some(dst) = host_copy(view) else {
         return false;
     };
+    // A matching descriptor or a writable binding does not prove the GPU
+    // produced these bytes. Earlier submissions can be followed by CPU
+    // streaming. Only a complete overwrite ordered before this read on the
+    // same list establishes ownership over every mip/layer at execution.
+    if !list.owns_packed_contents(&src) {
+        return false;
+    }
     list.copy_packed(&dst, &src);
+    list.packed_view_changed(view as usize);
     #[cfg(feature = "diagnostics")]
     {
         static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
