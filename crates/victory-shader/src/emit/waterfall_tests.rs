@@ -102,6 +102,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         mesh_wave32_compatible: false,
         record_stride: None,
         scalar_raw_srvs: Vec::new(),
+        direct_raw_indices: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

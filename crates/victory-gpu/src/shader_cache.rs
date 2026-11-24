@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH5";
+const MAGIC: &[u8; 4] = b"VSH6";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -226,6 +226,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
     for &(slot, offset) in &s.scalar_raw_srvs {
         word(&mut out, u32::from(slot));
         word(&mut out, offset);
+    }
+    word(&mut out, s.direct_raw_indices.len() as u32);
+    for &index in &s.direct_raw_indices {
+        word(&mut out, index);
     }
     // The dispatch precondition travels with its DXIL and root mapping.
     // A torn or damaged entry must never lose just the precondition.
@@ -323,11 +327,20 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         }
         scalar_raw_srvs.push(entry);
     }
+    let n = r.word()? as usize;
+    let mut direct_raw_indices = Vec::with_capacity(n.min(32));
+    for _ in 0..n {
+        let index = r.word()?;
+        if stage != HwStage::Cs || direct_raw_indices.last().is_some_and(|v| *v >= index)
+            || !user_data.iter().any(|u| u.root == RootType::Constants && u.index == index) { return None; }
+        direct_raw_indices.push(index);
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         mesh_wave32_compatible,
         record_stride,
         scalar_raw_srvs,
+        direct_raw_indices,
         dxil,
         user_data,
         samplers,
@@ -348,6 +361,7 @@ mod tests {
             mesh_wave32_compatible: false,
             record_stride: None,
             scalar_raw_srvs: Vec::new(),
+            direct_raw_indices: Vec::new(),
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -447,6 +461,7 @@ mod tests {
         guarded.stage = HwStage::Cs;
         guarded.scalar_raw_srvs = vec![(0, 0), (0, 8)];
         guarded.user_data[0].root = RootType::Constants;
+        guarded.direct_raw_indices = vec![guarded.user_data[0].index];
         guarded.record_stride = Some(guarded.user_data[0]);
         let encoded = encode(&guarded);
         assert_eq!(decode(&encoded), Some(guarded.clone()));
