@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 
+use victory_shader::emit::StrideEntry;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -33,8 +34,8 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
-    /// Per-slot element byte stride (`u32`) for structured buffers whose
-    /// stride shader analysis could not recover statically.
+    /// Per slot, what shaders need to read a buffer whose stride shader
+    /// analysis could not recover statically ([`StrideEntry`]).
     strides: Option<StrideTable>,
 }
 
@@ -47,7 +48,7 @@ struct StrideTable {
 
 impl StrideTable {
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = (u64::from(len) * 4).max(4);
+        let bytes = (u64::from(len) * u64::from(StrideEntry::BYTES)).max(8);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -362,7 +363,7 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, if ok { view_stride(view) } else { 0 });
+        self.set_entry(index, entry(ok.then(|| view_stride(view))));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -373,7 +374,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.set_entry(index, StrideEntry::default());
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -384,16 +385,22 @@ impl HostHeap {
         }
     }
 
-    fn set_stride(&self, index: u32, stride: u32) {
+    fn set_entry(&self, index: u32, entry: StrideEntry) {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
-            unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
+            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
+            // `t.len` entries of two dwords.
+            unsafe {
+                (t.ptr as *mut [u32; 2])
+                    .add(index as usize)
+                    .write(entry.words());
+            }
         }
     }
 
-    /// GPU virtual address of the per-slot element byte stride table.
+    /// GPU virtual address of the runtime stride table: a [`StrideEntry`]
+    /// per slot.
     pub(crate) fn stride_table_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|t| t.gpu)
     }
@@ -402,7 +409,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.set_entry(index, StrideEntry::default());
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -468,7 +475,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
-            self.set_stride(index, if ok { view_stride(&view) } else { 0 });
+            self.set_entry(index, entry(ok.then(|| view_stride(&view))));
         }
         Some(view)
     }
@@ -583,6 +590,15 @@ fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
         Some(4)
     } else {
         crate::resource::element(desc.Format.0 as u32).map(|(bytes, _)| bytes)
+    }
+}
+
+/// The runtime stride table's entry for a slot whose view has this element
+/// byte stride (none: the host did not make the view).
+fn entry(stride: Option<u32>) -> StrideEntry {
+    StrideEntry {
+        stride: stride.unwrap_or(0),
+        ..StrideEntry::default()
     }
 }
 
