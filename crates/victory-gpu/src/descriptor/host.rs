@@ -2534,12 +2534,18 @@ mod tests {
     /// that address in another format through `texture::alias`.
     #[test]
     fn placed_unordered_texture_view_mirrors_and_aliases_to_shader_view() {
-        let Some(host) = host() else {
-            return; // no host GPU
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
         };
-        let Some(heap) = HostHeap::new(false, 8) else {
-            return;
+        let host = host().expect("D3D12 device");
+        let heap = HostHeap::new(false, 8).expect("descriptor heap");
+        // SAFETY: immutable queries on the adapter of the device under test.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap().Description
         };
+        eprintln!("adapter {}", String::from_utf16_lossy(&adapter).trim_end_matches('\0'));
 
         // 1. 3D volume UAV (4x4x4 R32_UINT, resource flags = 0) mirrored via
         // `HostHeap::mirror(..., for_draw = false)` as a shader-visible heap
@@ -2579,6 +2585,30 @@ mod tests {
             panic!("expected View::Unordered");
         };
         assert_eq!(first_vol, second_vol, "must reuse existing UAV texture at address");
+
+        // A named target can be released while a placed view is being made.
+        // The borrowed reference spans lookup and recording, then the object's
+        // release invalidates the recorded descriptor generation.
+        #[repr(C, align(8))]
+        struct Aligned([u32; 14]);
+        let mut named_desc = Aligned(vol_res);
+        named_desc.0[12] = 4;
+        let named_at = vol_at + 0x40000;
+        let mut named_view = vol_uav;
+        named_view[10] = named_at as u32;
+        let mut named = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), named_at, named_desc.0.as_ptr().cast(), 0,
+            std::ptr::null(), &crate::resource::PAGEABLE_IIDS[0], &mut named,
+        ), crate::object::S_OK);
+        let placed = View::Placed(true, named_desc.0, named_view);
+        let (_, guard) = placed_texture(&placed).unwrap();
+        super::super::create_placed_uav(std::ptr::null(), &named_desc.0, &named_view, slot_handle);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(named, 16);
+        assert_eq!(release(named), 1);
+        assert!(heap.mirror(4, slot_handle, true).is_some());
+        drop(guard);
+        assert!(heap.mirror(4, slot_handle, true).is_none());
 
         // 2. Cross-format aliasing: a 4x4 R9G9B9E5_SHAREDEXP (67) description
         // written through an R32_UINT (42) placed UAV and then read through an
