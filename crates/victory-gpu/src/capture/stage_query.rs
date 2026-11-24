@@ -8,6 +8,27 @@ const SAMPLE_RECORDS: u32 = 4;
 const SNAPSHOT_WORDS: usize = 3 * SAMPLE_RECORDS as usize + 1;
 const STATS_BYTES: usize = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>();
 
+#[derive(Default)]
+struct SampleBudget {
+    recordings: u32,
+    late_samples: u8,
+    last_late_frame: Option<u64>,
+}
+
+impl SampleBudget {
+    fn next(&mut self, frame: u64, scene_ready: bool) -> Option<u32> {
+        self.recordings = self.recordings.saturating_add(1);
+        let early = self.recordings <= 4096 && self.recordings.is_power_of_two();
+        let late = scene_ready && self.late_samples < 6
+            && self.last_late_frame.is_none_or(|last| frame.saturating_sub(last) >= 8);
+        if late {
+            self.last_late_frame = Some(frame);
+            self.late_samples += 1;
+        }
+        (early || late).then_some(self.recordings)
+    }
+}
+
 #[derive(Debug)]
 struct Indirect {
     kind: u32,
@@ -22,6 +43,20 @@ struct Indirect {
 mod tests {
     use super::*;
     use crate::host::{host, transition};
+
+    #[test]
+    fn samples_compiled_scene_even_after_busy_loading_frames() {
+        let mut budget = SampleBudget::default();
+        assert_eq!((0..5000).filter(|_| budget.next(5, false).is_some()).count(), 13);
+        assert_eq!(budget.next(60, true), Some(5001));
+        for frame in 60..68 {
+            assert_eq!(budget.next(frame, true), None);
+        }
+        for frame in [68, 76, 84, 92, 100] {
+            assert!(budget.next(frame, true).is_some());
+        }
+        assert_eq!(budget.next(108, true), None);
+    }
 
     #[test]
     fn indirect_readback_preserves_shared_and_separate_counts() {
@@ -90,6 +125,7 @@ pub(crate) struct Query {
     hash: String,
     command: &'static str,
     recording: u32,
+    presented_at_record: u64,
     indirect: Option<Indirect>,
     reported: AtomicBool,
 }
@@ -131,20 +167,20 @@ impl Query {
             .hash;
         // Sample the first recording, then progressively later commands. Never retain
         // one readback per dispatch in a game that dispatches thousands per frame.
-        static COUNTS: OnceLock<Mutex<HashMap<(String, &'static str), u32>>> = OnceLock::new();
+        static COUNTS: OnceLock<Mutex<HashMap<(String, &'static str), SampleBudget>>> = OnceLock::new();
         let mut counts = COUNTS
             .get_or_init(Mutex::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let count = counts.entry((hash.clone(), command)).or_default();
-        *count = count.saturating_add(1);
-        if *count > 4096 || !count.is_power_of_two() {
-            return None;
-        }
-        let recording = *count;
+        let frame = crate::queue::presented();
+        let scene_ready = frame.saturating_sub(FIRST_BIND_PRESENT.load(Ordering::Relaxed)) >= 32
+            && crate::pipeline::making() == 0;
+        let recording = counts.entry((hash.clone(), command)).or_default().next(frame, scene_ready)?;
         drop(counts);
 
-        Self::allocate(hash, command, recording)
+        let mut query = Self::allocate(hash, command, recording)?;
+        query.presented_at_record = frame;
+        Some(query)
     }
 
     fn allocate(hash: &str, command: &'static str, recording: u32) -> Option<Self> {
@@ -230,6 +266,7 @@ impl Query {
                 hash: hash.to_owned(),
                 command,
                 recording,
+                presented_at_record: 0,
                 indirect: None,
                 reported: AtomicBool::new(false),
             })
@@ -403,10 +440,10 @@ impl Query {
                 max = info.max, argument = ?info.argument, count = ?info.count, shared_resource = info.shared_resource,
                 count_before = ?info.count.map(|_| snapshots[0][SNAPSHOT_WORDS-1]),
                 count_after = ?info.count.map(|_| snapshots[1][SNAPSHOT_WORDS-1]),
-                before = ?words(&snapshots[0]), after = ?words(&snapshots[1]), "GPU indirect argument readback");
+                before = ?words(&snapshots[0]), after = ?words(&snapshots[1]), presented_at_record = self.presented_at_record, "GPU indirect argument readback");
         }
         tracing::info!(hash = %self.hash, recording = self.recording, command = self.command, cs = stats.CSInvocations,
             ms = ?extended.then_some(stats.MSInvocations), primitives = ?extended.then_some(stats.MSPrimitives),
-            ps = stats.PSInvocations, "GPU shader invocation readback");
+            ps = stats.PSInvocations, presented_at_record = self.presented_at_record, "GPU shader invocation readback");
     }
 }
