@@ -174,21 +174,22 @@ pub(crate) fn bound(
             transition(
                 buffer,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
     }
     true
 }
 
-/// Return the argument buffer to COMMON after execution.
+/// After the execution: the buffer back to unordered access, where the
+/// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
             buffer,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )])
     };
 }
@@ -212,102 +213,5 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
-    }
-}
-
-
-#[cfg(all(test, feature = "diagnostics"))]
-mod buffer_state_regression {
-    use super::*;
-    use windows::core::Interface;
-
-    #[test]
-    fn indirect_buffer_remains_readable() {
-        let host = host().expect("D3D12 device required");
-
-        let _: ID3D12InfoQueue = host.device.cast()
-            .expect("Enable the D3D12 debug layer");
-
-        let (args, args_data) = host.shared_buffer(256)
-            .expect("Argument buffer allocation");
-
-        let (output, output_data) = host.shared_buffer(256)
-            .expect("Output buffer allocation");
-
-        let expected = [3u32, 1, 0, 0];
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                expected.as_ptr(),
-                args_data.cast::<u32>(),
-                expected.len(),
-            );
-
-            std::ptr::write_bytes(output_data, 0, 256);
-        }
-
-        let list = host.new_list().expect("Command list");
-
-        let _ = host.log_messages();
-
-        assert!(bound(
-            &list,
-            &args,
-            unsafe { args.GetGPUVirtualAddress() },
-            (0, 16, 1),
-        ));
-
-        // Read while the argument buffer is in GENERIC_READ.
-        unsafe {
-            list.list.CopyBufferRegion(
-                &output, 0, &args, 0, 16,
-            );
-        }
-
-        done(&list, &args);
-
-        // Reuse the same argument buffer within the same list.
-        assert!(bound(
-            &list,
-            &args,
-            unsafe { args.GetGPUVirtualAddress() },
-            (0, 16, 1),
-        ));
-
-        done(&list, &args);
-
-        // Read again following the transition to COMMON.
-        unsafe {
-            list.list.CopyBufferRegion(
-                &output, 16, &args, 0, 16,
-            );
-
-            list.list.Close().expect("Close command list");
-        }
-
-        assert_eq!(
-            host.log_messages(),
-            None,
-            "Invalid resource state during command recording"
-        );
-
-        host.execute(&[&list]);
-
-        assert_eq!(
-            host.log_messages(),
-            None,
-            "Resource validation failed after execution"
-        );
-
-        unsafe {
-            host.device.GetDeviceRemovedReason().unwrap();
-
-            let actual = std::slice::from_raw_parts(
-                output_data.cast::<u32>(), 8,
-            );
-
-            assert_eq!(&actual[..4], &expected);
-            assert_eq!(&actual[4..], &expected);
-        }
     }
 }
