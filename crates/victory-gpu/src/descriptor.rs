@@ -67,6 +67,28 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// Compare selected directly indexed views with the buffer already bound on the host.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn trace_direct_views(&self, hash: &str, recording: u64) {
+        if self.samplers() { return; }
+        static INDICES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        let indices = INDICES.get_or_init(|| {
+            std::env::var("VICTORY_CAPTURE_HEAP_INDICES").unwrap_or_default()
+                .split(',').filter_map(|v| v.trim().parse().ok()).take(16).collect()
+        });
+        let Some(step) = increment(self.desc.kind) else { return };
+        for &index in indices.iter().filter(|&&index| index < self.desc.count) {
+            let Some(at) = self.start.checked_add(u64::from(index) * u64::from(step)) else { continue };
+            let view = view(at);
+            let range = view.as_ref().and_then(host::buffer_range);
+            let retained = self.host.get().and_then(Option::as_ref)
+                .and_then(|host| host.retained_resource(index));
+            let backed = retained.as_ref().map(Option::is_some);
+            let shadow = retained.flatten().and_then(|res| range.and_then(|(a,n)| crate::shadow::bound_range(&res,a,n)));
+            tracing::info!(hash, recording, index, ?view, ?range, ?backed, ?shadow, "sampled direct heap descriptor");
+        }
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
