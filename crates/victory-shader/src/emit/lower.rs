@@ -257,6 +257,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// This mesh uses flattened group threads for all console lane operations.
     mesh_lane_independent: bool,
+    mesh_allocation: Option<super::mesh_uniform::Allocation>,
+    mesh_counts: Option<(V, V)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -554,7 +556,14 @@ impl<'a> Lower<'a> {
             let split_first_lane = x.native.wave64
                 && !x.target.runs(64)
                 && insts().any(|i| i.name() == "v_readfirstlane_b32" && !waterfall_read(x.res, i));
-            let reads_whole = split_first_lane || insts().any(whole);
+            // A 64-thread culling kernel branches on whether VCC is set in
+            // either half around its gathers. Run the existing single-wave
+            // console flow so the two host waves share that decision.
+            let gather_vote = x.native.wave64 && !x.target.runs(64) && x.target.runs(32)
+                && cs.threads == [64, 1, 1]
+                && insts().any(|i| matches!(i.name(), "image_gather4_l" | "image_gather4_l_o"))
+                && insts().any(|i| matches!(i.name(), "s_cbranch_vccz" | "s_cbranch_vccnz"));
+            let reads_whole = split_first_lane || insts().any(whole) || gather_vote;
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -682,11 +691,13 @@ impl<'a> Lower<'a> {
         }
         let mut no_barrier = HashSet::new();
         let mut mesh_lane_independent = false;
+        let mut mesh_allocation = None;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             mesh_lane_independent = independent_mesh_lanes(x, ms);
+            mesh_allocation = super::mesh_uniform::prove(x, ms);
             if mesh_lane_independent
                 && insts().any(|i| matches!(i.name(), "v_readlane_b32" | "v_readfirstlane_b32"))
             {
@@ -777,6 +788,8 @@ impl<'a> Lower<'a> {
             xchg: None,
             flat: None,
             mesh_lane_independent,
+            mesh_allocation,
+            mesh_counts: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -1230,7 +1243,9 @@ impl<'a> Lower<'a> {
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            if self.mesh_allocation.is_none() {
+                self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            }
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
@@ -1262,6 +1277,13 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if let Some(a) = self.mesh_allocation.filter(|a| a.site == (b,i)) {
+                    let vertices = self.i32_of(a.vertices).map_err(|w| unsupported(0,w))?;
+                    let primitives = self.i32_of(a.primitives).map_err(|w| unsupported(0,w))?;
+                    self.s.op(self.cur, "setMeshOutputCounts", Attr::NoUnwind,
+                        self.s.t.void, 168, &[vertices, primitives]);
+                    self.mesh_counts = Some((vertices, primitives));
+                }
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -1291,7 +1313,8 @@ impl<'a> Lower<'a> {
             self.s.wave_size = Some(32);
         }
         Ok(Lowered {
-            mesh_lane_independent: self.mesh_lane_independent && self.s.flags & flags::WAVE_OPS == 0,
+            mesh_lane_independent: (self.mesh_lane_independent || self.mesh_allocation.is_some())
+                && self.s.flags & flags::WAVE_OPS == 0,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -4853,6 +4876,10 @@ impl<'a> Lower<'a> {
                 let r = self.mesh_read_lane(a, first);
                 int(self, r)
             }
+            "v_readfirstlane_b32" if self.mesh_allocation.is_some() => {
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" if self.console_cf => {
                 // The console's first lane in EXEC (lane 0 when none).
                 let a = s(self, 0)?;
@@ -7285,8 +7312,21 @@ impl<'a> Lower<'a> {
         if e.compressed {
             return Err("a compressed export");
         }
-        let guard = self.guard(b, i)?;
+        let mut guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        if let Some((vertices, primitives)) = self.mesh_counts {
+            let limit = if matches!(e.target, Target::Primitive | Target::PrimitiveParam { .. }) {
+                primitives
+            } else {
+                vertices
+            };
+            let thread = self.mesh_thread();
+            let in_bounds = self.s.m.cmp(self.cur, pred::IULT, thread, limit);
+            guard = Some(match guard {
+                Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+                None => in_bounds,
+            });
+        }
         let c = self.cur;
         if let Some(g) = guard
             && !mesh
@@ -7494,12 +7534,20 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut args = vec![self.mesh_thread()];
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if let Some((vertices, _)) = self.mesh_counts {
+                let invalid = self.s.m.cmp(c, pred::IUGE, i, vertices);
+                culled = self.s.m.bin(c, Bin::Or, culled, invalid);
+            }
+            indices.push(i);
+        }
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
