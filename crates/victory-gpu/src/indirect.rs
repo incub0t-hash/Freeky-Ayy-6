@@ -466,7 +466,14 @@ void main() {
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                Self::from_device(device?)
+            }
+        }
+
+        fn from_device(device: ID3D12Device) -> Option<Self> {
+            // SAFETY: the queue, command list and synchronization objects
+            // all use this device and remain owned by the harness.
+            unsafe {
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -651,6 +658,11 @@ void main() {
         }
     }
 
+    mod card_hash_tests {
+        use super::*;
+        include!("indirect/card_hash_tests.rs");
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
@@ -664,7 +676,7 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, crate::host::CardHash::Serial.source()).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
