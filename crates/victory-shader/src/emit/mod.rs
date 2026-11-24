@@ -147,6 +147,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// The mesh lowering verified the source's lane operations can run on wave32.
+    pub mesh_wave32_compatible: bool,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -383,6 +385,7 @@ pub fn emit(
     };
     Ok(HostShader {
         stage: native.stage,
+        mesh_wave32_compatible: l.mesh_lane_independent,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -652,6 +655,7 @@ mod tests {
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
+            mesh_wave32_compatible: false,
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -662,6 +666,7 @@ mod tests {
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
                 stage,
+                mesh_wave32_compatible: false,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),
@@ -886,6 +891,35 @@ mod tests {
         lanes_min: 32,
         lanes_max: 64,
     };
+
+    #[test]
+    fn wave32_mesh_proof_requires_converged_full_wave_reads() {
+        use crate::native::{MeshIo, StageIo};
+        let compatible = |words: &[u32], threads, lds_bytes, primitives| {
+            let mut native = compute(words, true);
+            native.stage = crate::HwStage::Ms;
+            native.io = StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads,
+                max_vertices: threads,
+                max_primitives: primitives,
+                topology: 2,
+                lds_bytes,
+            });
+            emit_for(&native, NVIDIA).is_ok_and(|s| s.mesh_wave32_compatible)
+        };
+        let end = 0xBF81_0000;
+        let first = 0x7E12_0500; // v_readfirstlane_b32 s9, v0
+        assert!(compatible(&[first, end], 128, 0, 128));
+        assert!(!compatible(&[first, end], 32, 0, 32));
+        assert!(!compatible(&[first, end], 128, 4, 128));
+        assert!(!compatible(&[first, end], 128, 0, 64));
+        // Narrowing EXEC or branching can leave some group threads out of
+        // the lane exchange. Never reach a group barrier in these forms.
+        assert!(!compatible(&[0xBEFE_0380, first, end], 64, 0, 64));
+        assert!(!compatible(&[0xBF88_0001, first, end], 64, 0, 64));
+    }
 
     #[test]
     fn console_lanes_translate_only_for_hosts_with_that_wave_size() {

@@ -618,6 +618,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        mesh_wave32_compatible: false,
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {

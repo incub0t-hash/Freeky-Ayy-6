@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -183,6 +183,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, u32::from(s.mesh_wave32_compatible));
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -244,6 +245,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let mesh_wave32_compatible = match r.word()? {
+        0 => false,
+        1 if stage == HwStage::Ms => true,
+        _ => return None,
+    };
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -278,6 +284,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     r.0.is_empty().then_some(HostShader {
         stage,
+        mesh_wave32_compatible,
         dxil,
         user_data,
         samplers,
@@ -294,6 +301,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            mesh_wave32_compatible: false,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -381,5 +389,12 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        let mut mesh = shader();
+        mesh.stage = HwStage::Ms;
+        mesh.mesh_wave32_compatible = true;
+        assert_eq!(decode(&encode(&mesh)), Some(mesh));
+        let mut invalid = shader();
+        invalid.mesh_wave32_compatible = true;
+        assert_eq!(decode(&encode(&invalid)), None);
     }
 }

@@ -370,6 +370,29 @@ fn first_lane_reads_are_the_console_waves() {
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
 }
 
+#[test]
+fn standalone_readfirstlane_broadcasts_across_halves() {
+    let body = [
+        0x4A02_0091, // v_add_nc_u32 v1, 17, v0
+        0x7E12_0501, // v_readfirstlane_b32 s9, v1
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let target = super::Target { lanes_min: 32, lanes_max: 32 };
+    for threads in [48, 64] {
+        let p = program(&body, threads);
+        let cs = emit_for(&p, target).expect("one console wave");
+        assert_eq!(wave_size(&cs.dxil), Some(32));
+        program_case("standalone readfirstlane", &p, |_| 17, true);
+    }
+    assert!(matches!(
+        emit_for(&program(&body, 128), target),
+        Err(crate::ShaderError::Unsupported {
+            what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
+            ..
+        })
+    ));
+}
+
 /// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
 /// it still writes lane 40. The per-lane form never had lane 40 there.
 #[test]

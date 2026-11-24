@@ -31,6 +31,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub mesh_lane_independent: bool,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -252,6 +253,8 @@ struct Lower<'a> {
     xchg: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// This mesh uses flattened group threads for all console lane operations.
+    mesh_lane_independent: bool,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -343,6 +346,47 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     };
     ops.into_iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        _ => false,
+    })
+}
+
+/// A recognized descriptor waterfall already follows each lane's own
+/// descriptor, so its lowered read never broadcasts across lanes.
+fn waterfall_read(res: &Resources, inst: &Inst) -> bool {
+    inst.writes
+        .first()
+        .is_some_and(|w| res.waterfall.reads.contains(&w.1))
+}
+
+/// Straight-line mesh exports with full EXEC. Each output is owned by one
+/// group thread. Lane reads rendezvous using a slot per thread, so they
+/// require complete virtual waves and all threads must reach them.
+fn independent_mesh_lanes(x: &Parts<'_>, ms: &crate::native::MeshIo) -> bool {
+    let [block] = x.p.blocks.as_slice() else { return false };
+    if !x.native.wave64 || !matches!(ms.threads, 32 | 64 | 128)
+        || ms.lds_bytes != 0 || ms.topology != 2
+        || ms.max_vertices != ms.threads || ms.max_primitives != ms.threads
+        || !matches!(block.exit, Exit::End)
+    {
+        return false;
+    }
+    block.insts.iter().all(|i| match &i.fields {
+        Fields::Exp { target: 12 | 20, compr: false, .. } => true, // position or primitive
+        // There is no guest LDS or UAV traffic to order.
+        Fields::Sopp { .. } => matches!(i.name(), "s_endpgm" | "s_nop" | "s_waitcnt" | "s_barrier"),
+        Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => {
+            !i.writes.iter().any(|&(r, _)| r == Reg::S(EXEC) || r == Reg::S(EXEC + 1))
+                && match i.name() {
+                    "v_readlane_b32" => ms.threads.is_multiple_of(64)
+                        && matches!(v.src.get(1), Some(Operand::Scalar { code: 0..=105, .. }
+                            | Operand::Const(128..=208) | Operand::Literal(_))),
+                    "v_readfirstlane_b32" => ms.threads.is_multiple_of(64),
+                    "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" | "v_cmp_eq_u32"
+                    | "v_cndmask_b32" | "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
+                    | "v_lshrrev_b32" | "v_lshlrev_b32" | "v_or_b32" | "v_and_b32" => true,
+                    _ => false,
+                }
+        }
         _ => false,
     })
 }
@@ -446,7 +490,12 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
             };
-            let reads_whole = insts().any(whole);
+            // A standalone readfirstlane must also cross halves. A host
+            // wave's first active lane can differ even with full EXEC.
+            let split_first_lane = x.native.wave64
+                && !x.target.runs(64)
+                && insts().any(|i| i.name() == "v_readfirstlane_b32" && !waterfall_read(x.res, i));
+            let reads_whole = split_first_lane || insts().any(whole);
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -573,10 +622,17 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = HashSet::new();
+        let mut mesh_lane_independent = false;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            mesh_lane_independent = independent_mesh_lanes(x, ms);
+            if mesh_lane_independent
+                && insts().any(|i| matches!(i.name(), "v_readlane_b32" | "v_readfirstlane_b32"))
+            {
+                s.lds_dwords = ms.threads;
+            }
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -661,6 +717,7 @@ impl<'a> Lower<'a> {
             console_flat: None,
             xchg: None,
             flat: None,
+            mesh_lane_independent,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -1167,6 +1224,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            mesh_lane_independent: self.mesh_lane_independent && self.s.flags & flags::WAVE_OPS == 0,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2288,6 +2346,27 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    /// Read a register from lane `lane` of this thread's virtual wave.
+    /// Only reachable for the converged, full-wave case proven above.
+    fn mesh_read_lane(&mut self, value: V, lane: V) -> V {
+        let c = self.cur;
+        let flat = self.mesh_thread();
+        let scratch = self.s.lds();
+        let mine = self.s.m.element(c, scratch, flat);
+        self.s.m.store(c, mine, value);
+        let sync = self.s.m.i32(1 | 8); // group sync and groupshared memory fence
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[sync]);
+        let wave_mask = self.s.m.i32(!63);
+        let wave_base = self.s.m.bin(c, Bin::And, flat, wave_mask);
+        let lane_mask = self.s.m.i32(63);
+        let within_wave = self.s.m.bin(c, Bin::And, lane, lane_mask);
+        let index = self.s.m.bin(c, Bin::Or, wave_base, within_wave);
+        let source = self.s.m.element(c, scratch, index);
+        let result = self.s.m.load(c, source);
+        self.s.op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[sync]);
+        result
     }
 
     /// The console wave size.
@@ -4625,6 +4704,10 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                if self.mesh_lane_independent {
+                    let r = self.mesh_read_lane(a, lane);
+                    return int(self, r);
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -4659,15 +4742,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
-            "v_readfirstlane_b32"
-                if inst
-                    .writes
-                    .first()
-                    .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
-            {
+            "v_readfirstlane_b32" if waterfall_read(self.x.res, inst) => {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.mesh_lane_independent => {
+                let a = s(self, 0)?;
+                let first = self.s.m.i32(0); // full EXEC in the proven mesh form
+                let r = self.mesh_read_lane(a, first);
+                int(self, r)
             }
             "v_readfirstlane_b32" if self.console_cf => {
                 // The console's first lane in EXEC (lane 0 when none).

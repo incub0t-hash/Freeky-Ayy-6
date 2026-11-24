@@ -66,9 +66,9 @@ the host has no 64-lane waves and the program:
 
 Anything else still stops with the step 1 reason. `mask_dword`, the wave
 reduction lowering and `lane_bit` refuse the split form as a safety net.
-(A wave64 program that declares no wave size at all still runs in whatever
-waves the host forms, as on `main`: its `v_readfirstlane` reads the host
-wave's first lane.)
+On a wave32-only host, a standalone `v_readfirstlane` also requires the
+console flow, even if no other instruction uses the wave layout. A read
+in a recognized descriptor waterfall uses the lane's own descriptor.
 
 **What crosses halves** goes through an exchange in groupshared memory:
 
