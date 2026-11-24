@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -184,6 +184,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
     word(&mut out, u32::from(s.mesh_wave32_compatible));
+    word(&mut out, s.record_stride.map_or(u32::MAX, |u| u.index));
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -221,6 +222,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    // The dispatch precondition travels with its DXIL and root mapping.
+    // A torn or damaged entry must never lose just the precondition.
+    let digest = blake3::hash(&out);
+    out.extend(digest.as_bytes());
     out
 }
 
@@ -240,7 +245,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             Some(self.take(n)?.to_vec())
         }
     }
-    let mut r = Reader(bytes);
+    let (payload, digest) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+    if blake3::hash(payload).as_bytes() != digest {
+        return None;
+    }
+    let mut r = Reader(payload);
     if r.take(4)? != MAGIC {
         return None;
     }
@@ -250,6 +259,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         1 if stage == HwStage::Ms => true,
         _ => return None,
     };
+    let stride_index = r.word()?;
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -261,6 +271,22 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             dword: r.word()?,
         });
     }
+    let record_stride = if stride_index == u32::MAX {
+        None
+    } else {
+        if stage != HwStage::Cs {
+            return None;
+        }
+        let mut matches = user_data
+            .iter()
+            .copied()
+            .filter(|u| u.index == stride_index);
+        let u = matches.next()?;
+        if u.root != RootType::Constants || matches.next().is_some() {
+            return None;
+        }
+        Some(u)
+    };
     let n = r.word()? as usize;
     let mut samplers = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -285,6 +311,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     r.0.is_empty().then_some(HostShader {
         stage,
         mesh_wave32_compatible,
+        record_stride,
         dxil,
         user_data,
         samplers,
@@ -302,6 +329,7 @@ mod tests {
         HostShader {
             stage: HwStage::Ps,
             mesh_wave32_compatible: false,
+            record_stride: None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -396,5 +424,19 @@ mod tests {
         let mut invalid = shader();
         invalid.mesh_wave32_compatible = true;
         assert_eq!(decode(&encode(&invalid)), None);
+        let mut guarded = shader();
+        guarded.stage = HwStage::Cs;
+        guarded.user_data[0].root = RootType::Constants;
+        guarded.record_stride = Some(guarded.user_data[0]);
+        let encoded = encode(&guarded);
+        assert_eq!(decode(&encoded), Some(guarded.clone()));
+        let mut damaged = encoded;
+        damaged[12..16].fill(0xff); // wipe the stride requirement
+        assert!(decode(&damaged).is_none());
+        guarded.stage = HwStage::Ms;
+        assert!(decode(&encode(&guarded)).is_none());
+        guarded.stage = HwStage::Cs;
+        guarded.user_data[0].root = RootType::Table;
+        assert!(decode(&encode(&guarded)).is_none());
     }
 }

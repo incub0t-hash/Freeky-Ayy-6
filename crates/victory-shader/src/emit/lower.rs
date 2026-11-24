@@ -34,6 +34,7 @@ enum Val {
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     pub mesh_lane_independent: bool,
+    pub record_stride: Option<UserData>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -464,58 +465,141 @@ fn predicated_buffer_work(p: &Program) -> bool {
 /// coincide exactly (including stride zero and 32-bit address wrap). Every
 /// lane writes the same tuple, so coincident records have the same result.
 fn argument_record_stride(x: &Parts<'_>) -> Option<UserData> {
-    let [block] = x.p.blocks.as_slice() else { return None };
-    if block.exit != Exit::End { return None }
-    let [before @ .., store, end] = block.insts.as_slice() else { return None };
-    if store.name()!="buffer_store_dwordx4" || end.name()!="s_endpgm" {return None}
-    let Fields::Buffer {data:Some(Operand::Vector{reg,dwords:4}),addr:Operand::Vector{reg:off,dwords:1},
-        soffset:Operand::Const(128),offset:0,offen:true,idxen:false,format:None,lds:false,tfe:false,..}=store.fields else{return None};
-    let [descriptor]=x.res.descriptors.as_slice() else{return None};
-    let [(load,address)]=x.res.scalar.as_slice() else{return None};
-    if descriptor.site!=(0,before.len()) || descriptor.role!=Role::Resource
-        || descriptor.source!=(Source::Loaded {load:*load, first:0})
-        || address.dynamic.is_some() || x.native.layout.get(address.param)?.root!=RootType::Table
-    {return None}
-    for i in before {
-        let ok=match &i.fields {
-            Fields::Sop{dst:Some(Operand::Scalar{code:0..=105,..}),..}=>i.name()=="s_mov_b32",
-            Fields::Valu(v)=>matches!(i.name(),"v_mov_b32"|"v_lshl_add_u32"|"v_mul_lo_u32")
-                && v.dpp.is_none() && v.sdwa.is_none() && v.neg==0 && v.abs==0
-                && v.opsel==0 && v.omod==0 && !v.clamp,
-            Fields::Smem{..}=>i.name()=="s_load_dwordx4",
-            _=>false,
-        };
-        if !ok {return None}
-    }
-    let def=|v:Value| before.iter().find(|i| i.writes.iter().any(|w|w.1==v));
-    let src=|i:&Inst,op:Operand| match op {
-        Operand::Vector{reg,..}=>i.read(Reg::V(reg)),
-        Operand::Scalar{code,..}=>i.read(Reg::S(code)),
-        _=>None,
+    let [block] = x.p.blocks.as_slice() else {
+        return None;
     };
-    for (k,c) in [128,129,129,128].into_iter().enumerate() {
-        let mov=def(store.read(Reg::V(reg.checked_add(k as u8)?))?)?;
-        if mov.name()!="v_mov_b32" || !matches!(&mov.fields,Fields::Valu(v) if v.src.as_slice()==[Operand::Const(c)]) {return None}
+    if block.exit != Exit::End {
+        return None;
     }
-    let mul=def(store.read(Reg::V(off))?)?;
-    let Fields::Valu(v)=&mul.fields else{return None};
-    let [stride,id]=v.src.as_slice() else{return None};
-    if mul.name()!="v_mul_lo_u32" {return None}
-    let flat=def(src(mul,*id)?)?;
-    let Fields::Valu(v)=&flat.fields else{return None};
-    let [group,Operand::Const(134),thread]=v.src.as_slice() else{return None};
-    if flat.name()!="v_lshl_add_u32" || !x.io.inputs.contains(&(src(flat,*group)?,Input::GroupId(0)))
-        || !x.io.inputs.contains(&(src(flat,*thread)?,Input::ThreadIdInGroup(0))) {return None}
-    let mut stride=src(mul,*stride)?;
-    while let Some(mov)=def(stride) {
-        let Fields::Sop{src:ops,..}=&mov.fields else{return None};
-        let [s @ Operand::Scalar{code:0..=105,..}]=ops.as_slice() else{return None};
-        if mov.name()!="s_mov_b32" {return None}
-        stride=src(mov,*s)?;
+    let [before @ .., store, end] = block.insts.as_slice() else {
+        return None;
+    };
+    if store.name() != "buffer_store_dwordx4" || end.name() != "s_endpgm" {
+        return None;
     }
-    let &(_,param,dword)=x.res.params.iter().find(|p|p.0==stride)?;
-    let rp=x.native.layout.get(param)?;
-    (rp.root==RootType::Constants).then_some(UserData{index:u32::from(rp.user_data)+dword,slot:rp.slot,root:rp.root,dword})
+    let Fields::Buffer {
+        data: Some(Operand::Vector { reg, dwords: 4 }),
+        addr: Operand::Vector {
+            reg: off,
+            dwords: 1,
+        },
+        soffset: Operand::Const(128),
+        offset: 0,
+        offen: true,
+        idxen: false,
+        format: None,
+        lds: false,
+        tfe: false,
+        ..
+    } = store.fields
+    else {
+        return None;
+    };
+    let [descriptor] = x.res.descriptors.as_slice() else {
+        return None;
+    };
+    let [(load, address)] = x.res.scalar.as_slice() else {
+        return None;
+    };
+    if descriptor.site != (0, before.len())
+        || descriptor.role != Role::Resource
+        || descriptor.source
+            != (Source::Loaded {
+                load: *load,
+                first: 0,
+            })
+        || address.dynamic.is_some()
+        || x.native.layout.get(address.param)?.root != RootType::Table
+    {
+        return None;
+    }
+    for i in before {
+        let ok = match &i.fields {
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code: 0..=105, .. }),
+                ..
+            } => i.name() == "s_mov_b32",
+            Fields::Valu(v) => {
+                matches!(i.name(), "v_mov_b32" | "v_lshl_add_u32" | "v_mul_lo_u32")
+                    && v.dpp.is_none()
+                    && v.sdwa.is_none()
+                    && v.neg == 0
+                    && v.abs == 0
+                    && v.opsel == 0
+                    && v.omod == 0
+                    && !v.clamp
+            }
+            Fields::Smem { .. } => i.name() == "s_load_dwordx4",
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+    }
+    let def = |v: Value| before.iter().find(|i| i.writes.iter().any(|w| w.1 == v));
+    let src = |i: &Inst, op: Operand| match op {
+        Operand::Vector { reg, .. } => i.read(Reg::V(reg)),
+        Operand::Scalar { code, .. } => i.read(Reg::S(code)),
+        _ => None,
+    };
+    for (k, c) in [128, 129, 129, 128].into_iter().enumerate() {
+        let mov = def(store.read(Reg::V(reg.checked_add(k as u8)?))?)?;
+        if mov.name() != "v_mov_b32"
+            || !matches!(&mov.fields,Fields::Valu(v) if v.src.as_slice()==[Operand::Const(c)])
+        {
+            return None;
+        }
+    }
+    let mul = def(store.read(Reg::V(off))?)?;
+    let Fields::Valu(v) = &mul.fields else {
+        return None;
+    };
+    let [stride, id] = v.src.as_slice() else {
+        return None;
+    };
+    if mul.name() != "v_mul_lo_u32" {
+        return None;
+    }
+    let flat = def(src(mul, *id)?)?;
+    let Fields::Valu(v) = &flat.fields else {
+        return None;
+    };
+    let [group, Operand::Const(134), thread] = v.src.as_slice() else {
+        return None;
+    };
+    if flat.name() != "v_lshl_add_u32"
+        || !x
+            .io
+            .inputs
+            .contains(&(src(flat, *group)?, Input::GroupId(0)))
+        || !x
+            .io
+            .inputs
+            .contains(&(src(flat, *thread)?, Input::ThreadIdInGroup(0)))
+    {
+        return None;
+    }
+    let mut stride = src(mul, *stride)?;
+    while let Some(mov) = def(stride) {
+        let Fields::Sop { src: ops, .. } = &mov.fields else {
+            return None;
+        };
+        let [s @ Operand::Scalar { code: 0..=105, .. }] = ops.as_slice() else {
+            return None;
+        };
+        if mov.name() != "s_mov_b32" {
+            return None;
+        }
+        stride = src(mov, *s)?;
+    }
+    let &(_, param, dword) = x.res.params.iter().find(|p| p.0 == stride)?;
+    let rp = x.native.layout.get(param)?;
+    (rp.root == RootType::Constants).then_some(UserData {
+        index: u32::from(rp.user_data) + dword,
+        slot: rp.slot,
+        root: rp.root,
+        dword,
+    })
 }
 
 /// A one-thread compute group can never have a second active lane. The
@@ -1427,6 +1511,14 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let record_stride = (self.x.native.stage==HwStage::Cs && self.x.native.wave64
+            && !self.x.target.runs(64) && self.x.target.runs(32)
+            && self.s.threads==Some([64,1,1]) && self.s.lds_dwords==0
+            && self.s.wave_size.is_none() && self.s.flags & flags::WAVE_OPS==0)
+            .then(|| argument_record_stride(self.x)).flatten();
+        if record_stride.is_some() {
+            self.s.wave_size=Some(32);
+        }
         if self.x.native.stage == HwStage::Cs
             && self.x.native.wave64 && !self.x.target.runs(64) && self.x.target.runs(32)
             && self.s.lds_dwords == 0
@@ -1439,6 +1531,7 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             mesh_lane_independent: (self.mesh_lane_independent || self.mesh_allocation.is_some())
                 && self.s.flags & flags::WAVE_OPS == 0,
+            record_stride,
             cmp_samplers,
             root_cbvs,
             root_srvs,

@@ -90,6 +90,8 @@ pub mod host;
 mod lane_read_loop_tests;
 mod lower;
 mod mesh_uniform;
+#[cfg(all(test, windows))]
+mod record_init_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
@@ -153,6 +155,9 @@ pub struct HostShader {
     pub stage: HwStage,
     /// The mesh lowering verified the source's lane operations can run on wave32.
     pub mesh_wave32_compatible: bool,
+    /// A split-wave record initializer may dispatch only when this root
+    /// constant is present and its byte stride is a multiple of 16.
+    pub record_stride: Option<UserData>,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -171,6 +176,10 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    pub fn permits_dispatch(&self, constant: impl FnOnce(u8,u32)->Option<u32>) -> bool {
+        self.record_stride.is_none_or(|u| constant(u.slot,u.dword).is_some_and(|stride|stride.is_multiple_of(16)))
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -390,6 +399,7 @@ pub fn emit(
     Ok(HostShader {
         stage: native.stage,
         mesh_wave32_compatible: l.mesh_lane_independent,
+        record_stride: l.record_stride,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -660,6 +670,7 @@ mod tests {
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
             mesh_wave32_compatible: false,
+            record_stride: None,
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -671,6 +682,7 @@ mod tests {
             std::env::var(var).ok().map(|p| super::HostShader {
                 stage,
                 mesh_wave32_compatible: false,
+                record_stride: None,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),

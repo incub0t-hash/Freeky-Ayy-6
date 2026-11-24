@@ -30,9 +30,26 @@ enum Root {
     None,
     /// A descriptor table's first descriptor (an address in a heap).
     Table(u64),
-    Constants(Vec<u32>),
+    Constants(Vec<Option<u32>>),
     /// A root view's GPU address.
     View(u64),
+}
+
+#[cfg(test)]
+mod argument_stride_tests {
+    #[test]
+    fn sparse_root_updates_distinguish_unset_stride_from_zero() {
+        let mut state=super::State::default();
+        state.set_constants(true,1,&[16],1);
+        assert_eq!(state.compute_constant(1,0),None);
+        state.set_constants(false,1,&[32],0);
+        assert_eq!(state.compute_constant(1,0),None);
+        state.set_constants(true,1,&[0],0);
+        assert_eq!(state.compute_constant(1,0),Some(0));
+        assert_eq!(state.compute_constant(1,1),Some(16));
+        state.set_view(true,1,0);
+        assert_eq!(state.compute_constant(1,0),None);
+    }
 }
 
 #[repr(C)]
@@ -230,9 +247,11 @@ impl State {
         if let Root::Constants(c) = &mut roots[s] {
             let end = offset as usize + values.len();
             if c.len() < end {
-                c.resize(end, 0);
+                c.resize(end, None);
             }
-            c[offset as usize..end].copy_from_slice(values);
+            for (word, &value) in c[offset as usize..end].iter_mut().zip(values) {
+                *word = Some(value);
+            }
         }
     }
 
@@ -320,7 +339,7 @@ impl State {
                 }
             },
             (Some(Root::Constants(c)), RootType::Constants) => {
-                c.get(dword as usize).copied().unwrap_or(0)
+                c.get(dword as usize).copied().flatten().unwrap_or(0)
             }
             _ => {
                 once!(
@@ -529,6 +548,19 @@ impl State {
         true
     }
 
+    /// Check split-wave record strides from exactly the title root arguments
+    /// that bind() will copy. Missing constants cannot certify a dispatch.
+    fn permits_compute(&self, p: &HostPipeline) -> bool {
+        p.stages.iter().all(|stage| {
+            stage.translated().host.permits_dispatch(|slot,dword| self.compute_constant(slot,dword))
+        })
+    }
+
+    fn compute_constant(&self, slot: u8, dword: u32) -> Option<u32> {
+        let Root::Constants(words) = self.compute.get(usize::from(slot))? else { return None };
+        words.get(dword as usize).copied().flatten()
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -549,6 +581,12 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            return;
+        }
+        if !self.permits_compute(p) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("dispatch: argument record stride is missing or is not a multiple of 16".into());
             return;
         }
         if !self.bind(list, p, true) {
@@ -1057,6 +1095,10 @@ impl State {
         };
         if (kind == DISPATCH) != p.compute || (kind == MESH) != p.mesh {
             why("pipeline kind does not match the command signature");
+            return false;
+        }
+        if kind==DISPATCH && !self.permits_compute(p) {
+            why("argument record stride is missing or is not a multiple of 16");
             return false;
         }
         if self.topology == RECTANGLES && (kind == INDEXED || (kind == DRAW && !p.rectangle_stage)) {
