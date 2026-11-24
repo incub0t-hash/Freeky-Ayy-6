@@ -693,6 +693,9 @@ impl State {
             *n
         };
         tracing::info!(hash, recording, ?values, "sampled compute root dwords");
+        for &heap in self.heaps.iter().filter(|&&heap| heap != 0) {
+            crate::descriptor::heap(heap as This).trace_direct_views(hash, recording);
+        }
         for u in used.iter().filter(|u| u.root == RootType::Table) {
             let Some(&Root::Table(table)) = self.compute.get(usize::from(u.slot)) else {
                 tracing::info!(hash, recording, slot = u.slot, "sampled compute table missing");
