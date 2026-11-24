@@ -269,6 +269,11 @@ fn both_halves_gather_when_only_one_half_votes() {
 fn gather_accepts_rounded_lod_only_in_lanes_that_were_rounded() {
     let sampler = Some([0x1b6, 12 << 20, 0x1850_0000, 0]);
     let mut prefix = vec![
+        // An earlier scalar loop does not redefine the later compare's lane mask.
+        0xbe98_0380, // s_mov_b32 s24, 0
+        0x8118_8118, // s_add_i32 s24, s24, 1
+        0xbf0a_8218, // s_cmp_lt_u32 s24, 2
+        0xbf85_fffd, // s_cbranch_scc1 to the add
         0x0608_08ff, 0.25f32.to_bits(), // v_add_f32 v4, 0.25, v4 (fractional for all)
         0x7da8_0090, // v_cmpx_gt_u32 exec, 16, v0 (lower half)
         0x7e08_4504, // v_ceil_f32 v4, v4

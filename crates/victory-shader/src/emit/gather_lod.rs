@@ -1,10 +1,10 @@
 //! Prove a gather's clamped, finite LOD is integral on every lane that consumes it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
-use crate::structure::{Bool, Structured};
+use crate::structure::{Atom, Bool, Structured};
 
 pub(super) fn integral(
     p: &Program,
@@ -30,6 +30,7 @@ pub(super) fn integral(
         forward,
         console_flow,
         seen: HashMap::new(),
+        single_visit: HashMap::new(),
     };
     proof.value(value, 0)
 }
@@ -42,6 +43,7 @@ struct Proof<'a> {
     forward: bool,
     console_flow: bool,
     seen: HashMap<Value, bool>,
+    single_visit: HashMap<usize, bool>,
 }
 
 impl Proof<'_> {
@@ -74,7 +76,8 @@ impl Proof<'_> {
             };
             let all_write = guard.is_none_or(|g| {
                 g == Bool::TRUE
-                    || (self.forward && !self.st.bools.meet(&[(self.active, true), (g, false)]))
+                    || (!self.st.bools.meet(&[(self.active, true), (g, false)])
+                        && self.stable_mask(g))
             });
             (all_write
                 || inst
@@ -86,6 +89,41 @@ impl Proof<'_> {
         };
         self.seen.insert(value, proven);
         proven
+    }
+
+    /// The producer's predicate can be compared to the later consumer's
+    /// EXEC when every atom in the former is immutable for this invocation.
+    /// An unrelated loop elsewhere does not redefine a value written once.
+    fn stable_mask(&mut self, guard: Bool) -> bool {
+        if self.forward {
+            return true;
+        }
+        self.st.bools.support(guard).into_iter().all(|atom| {
+            let v = match atom {
+                Atom::Constant(_) => return true,
+                Atom::Lane(v)
+                | Atom::Uniform(v)
+                | Atom::Phi(v)
+                | Atom::Quad(v)
+                | Atom::Opaque(v) => v,
+            };
+            let Some(&b) = self.defs.get(&v) else {
+                return false;
+            };
+            *self.single_visit.entry(b).or_insert_with(|| {
+                let mut todo = self.p.blocks[b].exit.successors();
+                let mut seen = HashSet::new();
+                while let Some(succ) = todo.pop() {
+                    if succ == b {
+                        return false;
+                    }
+                    if seen.insert(succ) {
+                        todo.extend(self.p.blocks[succ].exit.successors());
+                    }
+                }
+                true
+            })
+        })
     }
 
     fn result(&mut self, inst: &Inst, depth: usize) -> bool {
