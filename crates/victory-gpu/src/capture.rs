@@ -11,6 +11,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 pub(crate) mod stage_query;
+pub(crate) mod cull_indices;
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {

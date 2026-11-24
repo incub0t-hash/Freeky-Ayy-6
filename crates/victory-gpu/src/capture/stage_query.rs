@@ -7,6 +7,7 @@ use std::sync::{Mutex, atomic::AtomicBool};
 const SAMPLE_RECORDS: u32 = 4;
 const SNAPSHOT_WORDS: usize = 3 * SAMPLE_RECORDS as usize + 1;
 const STATS_BYTES: usize = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>();
+const CULL_OFFSET: usize = STATS_BYTES + 8 * SNAPSHOT_WORDS;
 
 #[derive(Default)]
 struct SampleBudget {
@@ -43,6 +44,60 @@ struct Indirect {
 mod tests {
     use super::*;
     use crate::host::host;
+
+    #[test]
+    fn gpu_cull_secondary_index_limits_and_gpu_written_parameters() {
+        use super::super::cull_indices::{Inputs, record};
+        let host = host().expect("D3D12 device");
+        let inactive = u32::MAX;
+        let outside = inactive - 1;
+        for (start, dims, expected) in [
+            (8u32, [8u32, 1, 1], [17, 0, 0x00ff_ffff, 99]),
+            (8, [2, 1, 1], [17, 0, inactive, inactive]),
+            (80, [2, 1, 1], [99, outside, inactive, inactive]),
+            (u32::MAX - 3, [1, 1, 1], [outside, inactive, inactive, inactive]),
+            (8, [8, 0, 1], [inactive; 4]),
+        ] {
+            const SIZE: u64 = 256;
+            let list = host.new_list().unwrap();
+            let (scene, data) = host.shared_buffer(SIZE).unwrap();
+            let (upload, mapped) = host.upload_buffer(SIZE).unwrap();
+            let params = Inputs {
+                resource: scene.clone(), param_offset: 4, scene_offset: 32, scene_len: 88,
+            };
+            let query = Query::allocate("fc5e66f8f873d3bb", "indirect", 1).unwrap();
+            // SAFETY: dword-aligned offsets in two 256-byte buffers and a fence
+            // before reading the GPU result. Only the GPU copy populates scene.
+            unsafe {
+                std::ptr::write_bytes(mapped, 0, SIZE as usize);
+                mapped.add(4).cast::<u32>().write(start);
+                std::ptr::copy_nonoverlapping(dims.as_ptr(), mapped.add(192).cast(), 3);
+                for (group, value) in [0xf100_0011u32, 0xcc00_0000, 0x99ff_ffff, 0x0100_0063].into_iter().enumerate() {
+                    mapped.add(32 + 8 + 24 * group).cast::<u32>().write(value);
+                }
+                list.buffer_access(&scene, D3D12_RESOURCE_STATE_COPY_DEST);
+                list.list.CopyBufferRegion(&scene, 0, &upload, 0, SIZE);
+                let prior = if dims[0] > 2 { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_GENERIC_READ };
+                list.buffer_access(&scene, prior);
+                assert!(!record(&list, &params, (&upload, 192), &query.readback, CULL_OFFSET as u64));
+                assert!(!record(&list, &params, (&scene, 193), &query.readback, CULL_OFFSET as u64));
+                assert!(!record(&list, &params, (&scene, 252), &query.readback, CULL_OFFSET as u64));
+                assert!(!record(&list, &params, (&scene, 192), &query.readback, CULL_OFFSET as u64 + 4));
+                assert!(record(&list, &params, (&scene, 192), &query.readback, CULL_OFFSET as u64));
+                assert_eq!(list.buffer_state(&scene), prior);
+                list.close();
+                assert_eq!(host.log_messages(), None);
+                host.execute(&[&list]);
+                host.device.GetDeviceRemovedReason().unwrap();
+                let mut out = std::ptr::null_mut();
+                query.readback.Map(0, None, Some(&mut out)).unwrap();
+                assert_eq!(std::slice::from_raw_parts(out.cast::<u8>().add(CULL_OFFSET).cast::<u32>(), 4), &expected);
+                query.readback.Unmap(0, Some(&D3D12_RANGE::default()));
+                assert_eq!(std::slice::from_raw_parts(data, SIZE as usize), std::slice::from_raw_parts(mapped, SIZE as usize));
+                assert_eq!(host.log_messages(), None);
+            }
+        }
+    }
 
     #[test]
     fn samples_compiled_scene_even_after_busy_loading_frames() {
@@ -120,6 +175,7 @@ pub(crate) struct Query {
     recording: u32,
     presented_at_record: u64,
     indirect: Option<Indirect>,
+    cull_indices: bool,
     reported: AtomicBool,
 }
 
@@ -217,7 +273,9 @@ impl Query {
                     8 * SNAPSHOT_WORDS
                 } else {
                     0
-                }) as u64,
+                } + if command == "indirect" && super::cull_indices::supported(hash) {
+                    super::cull_indices::BYTES
+                } else {0}) as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -261,6 +319,7 @@ impl Query {
                 recording,
                 presented_at_record: 0,
                 indirect: None,
+                cull_indices: false,
                 reported: AtomicBool::new(false),
             })
         }
@@ -354,16 +413,36 @@ impl Query {
     }
 
     pub(crate) fn end(self, list: &HostList) {
+        self.end_with_cull(list, None);
+    }
+
+    pub(crate) fn wants_cull(&self) -> bool {
+        super::cull_indices::supported(&self.hash)
+            && self.indirect.as_ref().is_some_and(|i| {
+                i.kind == 2 && i.stride == 12 && i.max == 1 && i.count.is_none()
+            })
+    }
+
+    pub(crate) fn end_with_cull(
+        mut self,
+        list: &HostList,
+        cull: Option<(&super::cull_indices::Inputs, (&ID3D12Resource, u64))>,
+    ) -> bool {
         // SAFETY: the matching begin preceded exactly one command on this list.
         unsafe {
             list.list.EndQuery(&self.heap, self.ty, 0);
             list.list
                 .ResolveQueryData(&self.heap, self.ty, 0, 1, &self.readback, 0);
         }
+        if self.wants_cull() && let Some((input, arg)) = cull {
+            self.cull_indices = super::cull_indices::record(list, input, arg, &self.readback, CULL_OFFSET as u64);
+        }
+        let changed = self.cull_indices;
         list.stage_queries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(self);
+        changed
     }
 
     pub(crate) fn report(&self) {
@@ -379,6 +458,7 @@ impl Query {
         let mut data = std::ptr::null_mut();
         let mut stats = D3D12_QUERY_DATA_PIPELINE_STATISTICS1::default();
         let mut snapshots = [[0u32; SNAPSHOT_WORDS]; 2];
+        let mut cull = [u32::MAX; 4];
         // SAFETY: Host::execute verified the submission fence. The base structure is
         // the documented prefix of STATISTICS1. Copy only bytes resolved by the GPU.
         unsafe {
@@ -388,7 +468,9 @@ impl Query {
                     0,
                     Some(&D3D12_RANGE {
                         Begin: 0,
-                        End: if self.indirect.is_some() {
+                        End: if self.cull_indices {
+                            CULL_OFFSET + super::cull_indices::BYTES
+                        } else if self.indirect.is_some() {
                             STATS_BYTES + size_of_val(&snapshots)
                         } else {
                             size
@@ -415,7 +497,16 @@ impl Query {
                     }
                 }
             }
+            if self.cull_indices {
+                std::ptr::copy_nonoverlapping(data.cast::<u8>().add(CULL_OFFSET).cast::<u32>(), cull.as_mut_ptr(), 4);
+            }
             self.readback.Unmap(0, Some(&D3D12_RANGE::default()));
+        }
+        if self.cull_indices {
+            let indices: Vec<_> = cull.into_iter().take_while(|i| *i != u32::MAX)
+                .map(|i| (i != u32::MAX - 1).then_some(i)).collect();
+            tracing::info!(hash = %self.hash, recording = self.recording,
+                presented_at_record = self.presented_at_record, ?indices, "GPU culler secondary heap indices");
         }
         if let Some(info) = &self.indirect {
             let n = info.max.min(SAMPLE_RECORDS) as usize * 3;
