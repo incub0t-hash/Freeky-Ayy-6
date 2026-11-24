@@ -1109,7 +1109,7 @@ mod tests {
         let key = observation::view(handle).unwrap().0;
         create_cbv(std::ptr::null(), &[0x200, 0, 256, 0], handle);
         assert_ne!(observation::view(handle).unwrap().0, key);
-        assert_eq!(release(h), 0);
+        assert_eq!(release_heap(h), 0);
         assert!(bound.slot(2).contains("released"));
     }
 
