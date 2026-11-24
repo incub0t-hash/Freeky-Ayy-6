@@ -938,6 +938,22 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// Snapshot a page list that the title may still be populating. Only our
+/// private copy is exposed as Rust references. A partial read cannot supply
+/// the missing page IDs from an earlier snapshot.
+fn snapshot_page_ids(source: *const c_void, pages: &mut [usize]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let size = size_of_val(pages);
+    let mut copied = 0;
+    // SAFETY: the OS checks the guest range. The destination has exactly
+    // `size` writable bytes, and every bit pattern is a valid page number.
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), source, pages.as_mut_ptr().cast(), size, &mut copied) != 0
+            && copied == size
+    }
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -958,36 +974,71 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    if len == 0 {
+        return fill(&mut []).map(drop);
+    }
+    let count = offset.checked_add(len).ok_or(E_INVALIDARG)?.div_ceil(PAGE);
+    let mut small = [0usize; 8];
+    let mut large;
+    let pages = if count <= small.len() {
+        &mut small[..count]
+    } else {
+        large = vec![0; count];
+        large.as_mut_slice()
     };
+    let snapshot = snapshot_page_ids(request.destination, pages);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if snapshot && let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+    let data = data.get(..n).ok_or(E_INVALIDARG)?;
+    if data.is_empty() {
+        return Ok(());
     }
+    // A short compressed stream need not name pages its output never reaches.
+    let pages = &mut pages[..(offset + n).div_ceil(PAGE)];
+    if !snapshot && !snapshot_page_ids(request.destination, pages) {
+        tracing::warn!(offset, n, pages = pages.len(), "dstorage: destination physical page list unreadable");
+        return Err(E_INVALIDARG);
+    }
+    let was_zero = pages.contains(&0);
+    if was_zero {
+        // An automatically submitted queue may start the request before the
+        // title publishes its page numbers. Reuse the bytes already decoded.
+        use std::time::{Duration, Instant};
+        const BUDGET: Duration = Duration::from_millis(8);
+        let started = Instant::now();
+        loop {
+            if !snapshot_page_ids(request.destination, pages) {
+                tracing::warn!(offset, n, pages = pages.len(), "dstorage: destination physical page list unreadable on retry");
+                return Err(E_INVALIDARG);
+            }
+            if !pages.contains(&0) {
+                break;
+            }
+            let remaining = BUDGET.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                tracing::warn!(offset, n, pages = pages.len(), "dstorage: destination physical page list still contains zero after bounded retry");
+                return Err(E_INVALIDARG);
+            }
+            std::thread::sleep(Duration::from_millis(1).min(remaining));
+        }
+    }
+    if !super::xmem::write_physical(pages, offset, data) {
+        tracing::warn!(offset, n, pages = pages.len(), "dstorage: populated destination physical page list rejected (unknown nonzero page or host mapping failure)");
+        return Err(E_INVALIDARG);
+    }
+    if was_zero {
+        static LATE: AtomicU64 = AtomicU64::new(0);
+        let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+        if late.is_power_of_two() {
+            tracing::info!(late, "dstorage: destination physical page list filled late, request completed");
+        }
+    }
+    Ok(())
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1494,6 +1545,46 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    #[test]
+    fn a_late_page_list_writes_the_decoded_bytes_once() {
+        use crate::modules::xmem;
+        use std::sync::atomic::AtomicUsize;
+        let (mut ids, mut count) = ([0usize; 2], 2);
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut count, ids.as_mut_ptr()), 1);
+        let list = [AtomicUsize::new(ids[0]), AtomicUsize::new(0)];
+        let plain = [0x81, 0x24, 0x63, 0xab];
+        let mut r = request(PAGE_DESTINATION | MEMORY_SOURCE, list[0].as_ptr().cast(),
+            4, plain.as_ptr().cast(), 0, 4);
+        r.page_offset = (PAGE - 2) as u64;
+        let mut calls = 0;
+        let result = into_destination(&r, 4, |out| {
+            calls += 1;
+            out.copy_from_slice(&plain);
+            // Publish the last ID after the first snapshot, without relying on
+            // thread scheduling. The buffered decode must not be repeated.
+            list[1].store(ids[1], Ordering::Release);
+            Ok(4)
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 1);
+        assert_eq!(xmem::page_window(&ids, PAGE - 2, 4).unwrap().bytes(), plain);
+
+        // Only the first two bytes will be produced. The unavailable page
+        // after them must play no part in validation or scatter writes.
+        list[1].store(0, Ordering::Release);
+        assert_eq!(into_destination(&r, 4, |out| {
+            out[..2].copy_from_slice(&[7, 8]);
+            Ok(2)
+        }), Ok(()));
+        for bad in [usize::MAX, 0] {
+            list[1].store(bad, Ordering::Release);
+            assert_eq!(into_destination(&r, 4, |out| { out.fill(99); Ok(4) }), Err(E_INVALIDARG));
+        }
+        assert_eq!(xmem::page_window(&ids, PAGE - 2, 4).unwrap().bytes(),
+            [7, 8, plain[2], plain[3]]);
+        assert_eq!(xmem::XMemFreePhysicalPages(2, ids.as_ptr()), 1);
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
