@@ -351,11 +351,16 @@ struct Section {
     persistent: OnceLock<Option<MappedBase>>,
     /// The section's size in bytes.
     size: usize,
-    /// One bit per 64 KiB page, set once the page is committed in the
-    /// persistent view. A saved call, not a guarantee: `commit` is
-    /// idempotent, so the DirectStorage workers may write this concurrently
-    /// and a lost race costs one redundant call.
+    /// One bit per 64 KiB page, set once committed through the persistent
+    /// view. A saved call, not a guarantee: `commit` is idempotent, so the
+    /// DirectStorage workers may write this concurrently and a lost race
+    /// costs one redundant call. It records this view's own commits only;
+    /// the temporary path's are not recorded, by design.
     committed: Box<[AtomicU64]>,
+    /// Whether a warn has been said for a write that fell back to a
+    /// temporary view, so a run with the switch on can tell which sections
+    /// are really persistent.
+    fallback_noted: OnceLock<()>,
 }
 
 impl Section {
@@ -393,6 +398,7 @@ impl Section {
             handle,
             reserved,
             persistent: OnceLock::new(),
+            fallback_noted: OnceLock::new(),
             size,
             committed: (0..(size / PAGE).div_ceil(64))
                 .map(|_| AtomicU64::new(0))
@@ -407,6 +413,18 @@ unsafe impl Send for Section {}
 unsafe impl Sync for Section {}
 
 impl Section {
+    /// Says once per section that a write fell back to a temporary view.
+    /// Without it a run with the switch on cannot tell a section that
+    /// persisted from one that did not, which is the evidence the switch
+    /// becoming the default is supposed to rest on.
+    fn note_fallback(&self) {
+        if self.fallback_noted.set(()).is_ok() {
+            tracing::warn!(
+                size = self.size,
+                "a commit through the persistent view failed; this section's pages keep a temporary view per write"
+            );
+        }
+    }
 
     /// The section's whole range, mapped read-write once and kept. A write
     /// through it is a store; a view per write is a map, a commit and an
@@ -454,17 +472,22 @@ impl Section {
     }
 
     /// Commits pages `[start_page, start_page + count)` of the persistent
-    /// view at `base`. A page committed before costs no call at all, which
-    /// is the point: the title commits every page it writes. False when the
-    /// range leaves the section or the host refuses.
+    /// view at `base`. A page this view committed before costs no call at
+    /// all, which is the point. False when the range leaves the section or
+    /// the host refuses.
     ///
-    /// The `committed_all` early return is a saved call rather than a
-    /// correctness guard: `commit` over a committed page succeeds and
-    /// changes nothing. Probe run 2026-11-25 — with the branch forced off,
-    /// `cargo test -p victory-hle xmem::` still passes 16 of 16, so no test
-    /// can see it and this is the one surviving mutation. Its effect is
-    /// measured by a run (`VICTORY_XMEM_PERSISTENT_VIEW=1`), not asserted by
-    /// one, which is the deliberate choice recorded here.
+    /// The bounds check is a real guard, not a saved call: it is what keeps
+    /// `committed_all`'s page arithmetic inside `committed`, and a
+    /// zero-length range past the end is refused by it alone (pinned by
+    /// `ensure_committed_refuses_ranges_outside_the_section`).
+    ///
+    /// The `committed_all` early return is the one surviving mutation: a
+    /// saved call, not a guard, since `commit` over a committed page
+    /// succeeds and changes nothing. Probe run 2026-11-25 — with the branch
+    /// forced off, `cargo test -p victory-hle xmem::` still passes, so no
+    /// test can see it, and its effect is measured by a run
+    /// (`VICTORY_XMEM_PERSISTENT_VIEW=1`) rather than asserted by one. That
+    /// choice is deliberate and recorded here.
     fn ensure_committed(&self, base: *mut u8, start_page: usize, count: usize) -> bool {
         let Some(end_page) = start_page.checked_add(count) else {
             return false;
@@ -479,8 +502,11 @@ impl Section {
             return true;
         }
         // One commit for the whole range: pages committed before are left
-        // as they are, and `commit` reports a host at its commit limit
-        // exactly as the temporary path does.
+        // as they are. A host at its commit limit is reported here and, if
+        // the caller then retries on the temporary path, reported again by
+        // that path's own `commit` -- two crash-log lines for one failure,
+        // which is asked for rather than avoided: the retry is what gives
+        // the caller the same answer it would have had before.
         // SAFETY: `[start_page, end_page)` lies inside the section's view.
         let at = unsafe { base.add(start_page * PAGE) };
         if self.reserved && !commit(at as usize, count * PAGE) {
@@ -672,7 +698,8 @@ impl Mapping {
             // one used, so a host refusing either half of the persistent
             // path lands there rather than failing a write.
             Mapping::Persistent => View::persistent(slice, n).or_else(|| View::temporary(slice, n)),
-            _ => View::temporary(slice, n),
+            // `Default` was resolved above: both are the old path.
+            Mapping::Temporary | Mapping::Default => View::temporary(slice, n),
         }
     }
 }
@@ -724,11 +751,21 @@ impl View {
         let base = slice.section.persistent_ptr()?;
         let len = n.checked_mul(PAGE)?;
         if !slice.section.ensure_committed(base, slice.index, n) {
+            slice.section.note_fallback();
             return None;
         }
         // SAFETY: `ensure_committed` proved `[slice.index, slice.index + n)`
         // lies inside the section, so this is inside the section's view.
         let ptr = unsafe { base.add(slice.index * PAGE) };
+        // Said once: whether the switch is really in effect is otherwise
+        // invisible in a run, and the switch becoming the default rests on a
+        // run that showed it working.
+        static IN_USE: OnceLock<()> = OnceLock::new();
+        if IN_USE.set(()).is_ok() {
+            tracing::info!(
+                "physical pages are written through one persistent view per section (VICTORY_XMEM_PERSISTENT_VIEW=1)"
+            );
+        }
         Some(View::Persistent {
             _section: slice.section.clone(),
             ptr,
@@ -741,11 +778,17 @@ impl View {
             View::Temporary { at, len } => (at.Value.cast::<u8>(), *len),
             View::Persistent { ptr, len, .. } => (*ptr, *len),
         };
-        // SAFETY: the view holds `len` committed read-write bytes, ours alone
-        // while `self` lives (other views of the slices only alias them, as
-        // the console's do). The persistent variant is the section's one
-        // mapping, shared with writes to other slices: each writes bytes of
-        // its own, exactly as they did through separate temporary views.
+        // SAFETY: the view holds `len` committed read-write bytes. For a
+        // temporary view those bytes have an address of their own, so no
+        // other borrow of them exists. For the persistent variant the
+        // section's one mapping is shared, and keeping two live `&mut [u8]`
+        // at one base apart is this module's job: callers hand out one run
+        // per write in flight, and two writes in flight in one section never
+        // cover the same page, because the title writes each destination
+        // alone (`dstorage`). That disjointness is a precondition of this
+        // variant, not a convention: overlapping runs would be undefined
+        // behaviour here, where two separate virtual views made them merely
+        // a race.
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
@@ -1717,9 +1760,11 @@ mod tests {
         physical().pages.get(&page).cloned().expect("known page")
     }
 
-    /// The bytes of one page, through a view of our own.
+    /// The bytes of one page, through a view of our own. The temporary path
+    /// explicitly, so the tests that existed before the persistent one are
+    /// its negative control whatever the environment says.
     fn page_bytes(page: usize) -> Vec<u8> {
-        Mapping::Default
+        Mapping::Temporary
             .view(&slice_of(page), 1)
             .expect("mapped")
             .bytes()
@@ -1889,7 +1934,13 @@ mod tests {
             window.bytes().fill(0xa5);
         }
         let base = section.persistent_ptr().expect("mapped whole");
-
+        // The window really went through the section's mapping: only that
+        // path commits pages, and a fallback to a temporary view would leave
+        // both bits clear while every byte assertion below still held.
+        assert!(
+            section.committed_all(0, 2),
+            "the window fell back to a temporary view"
+        );
         // The window dropped, and nothing unmapped: the next window is the
         // same map, and it shows what the first wrote.
         let mut window = page_window_with(Mapping::Persistent, &pages, 0, 4).expect("one run");
@@ -1943,6 +1994,11 @@ mod tests {
         assert!(!section.ensure_committed(base, usize::MAX, 1));
         assert!(!section.ensure_committed(base, 0, usize::MAX));
         assert!(!section.ensure_committed(base, usize::MAX / 2, usize::MAX / 2));
+        // A range of no pages past the end: refused by the size comparison
+        // alone. Delete that comparison and `committed_all` is vacuously
+        // true here and the call succeeds, so this pins the clause the host
+        // would otherwise supply the answer for.
+        assert!(!section.ensure_committed(base, 3, 0));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
