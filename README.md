@@ -14,12 +14,19 @@ Both diner characters and their clothing appear in these captures. The later yar
 
 The reference interval contains 16 presented frames over 14.84 seconds, approximately 1.08 FPS. Nearby Windows per-process counters measured 8.34 and 8.64 GiB of dedicated VRAM. The hardware was an RTX 3080 Ti with 12 GB VRAM, i9-14900KF, 32 GB system RAM and Windows.
 
-## Build
+## Portable runtime
+
+The GitHub release ZIP includes the original renderer binary, a shader-cache preparation binary, checkpoint, settings, launch and memory monitoring tools, Microsoft's signed x64 C++ runtime installer, source history with 59 research branches, local source patches and file checksums.
+
+Extract the ZIP and drag your own game executable onto `Play.cmd`. The first launch prepares the reference shaders from your game files. See [portable instructions](tools/portable/README.md).
+
+## Build from source
 
 Use the Windows Rust/MSVC toolchain and the upstream prerequisites.
 
 ```powershell
 cargo build --locked --profile diag -p victory --features diagnostics
+cargo build --locked --profile diag -p victory-prepare-cache
 ```
 
 ## Reproduce
@@ -33,6 +40,8 @@ Supply your game executable and a VIctory player-data directory containing `7952
 Add `-WarmCache 'E:\reference-cache'` to use a cache prepared for your executable and GPU driver. The reference started from a verified 2,492-shader cache and a 163,782,710-byte driver pipeline library. Executable fingerprints and driver versions affect cache validity. The first run on a new build compiles its graphics pipelines.
 
 The runner records displayed frames, timings, CPU memory and dedicated/shared GPU memory under its printed session folder. Creating `scene-reviewed.stop` in that folder ends the run after a visual check. Its default duration is 240 seconds. The Series X process working-set ceiling is 16 GiB, with guards at 2 GiB available physical memory and 1.5 GiB available commit. The complete renderer switches are in [reference-settings.json](tools/diner/reference-settings.json).
+
+To assemble another portable runtime, use [Build-Package.ps1](tools/portable/Build-Package.ps1) with the renderer executable, prepared helper, a VIctory checkpoint directory and Microsoft's signed runtime installer. The package's `source.bundle` restores the complete source on a machine with Git.
 
 ## Development target
 

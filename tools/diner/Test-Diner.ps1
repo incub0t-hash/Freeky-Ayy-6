@@ -5,8 +5,9 @@ param(
     [string]$Renderer = (Join-Path $PSScriptRoot '..\..\target\diag\victory.exe'),
     [string]$WarmCache,
     [string]$WorkingDirectory = (Join-Path $PSScriptRoot '..\..'),
-    [string]$Reports = (Join-Path $PSScriptRoot 'runs'),
-    [ValidateRange(10,600)][int]$Seconds = 240
+    [string]$Reports = (Join-Path $env:LOCALAPPDATA 'Freeky-Ayy-6\comparisons'),
+    [ValidateRange(10,1200)][int]$Seconds = 240,
+    [switch]$PlaySession
 )
 $ErrorActionPreference='Stop'
 $game=(Get-Item -LiteralPath $GameExe).FullName
@@ -31,7 +32,10 @@ $data=Join-Path $out 'data'
 $cache=Join-Path $out 'cache'
 $frames=Join-Path $out 'frames'
 New-Item -ItemType Directory -Path $frames,(Join-Path $out 'guest-pages') | Out-Null
-Copy-Item -LiteralPath $PlayerData -Destination $data -Recurse
+if($PlaySession) {
+    $data=Join-Path $Reports 'player-data'
+    if(!(Test-Path -LiteralPath $data)){Copy-Item -LiteralPath $PlayerData -Destination $data -Recurse}
+} else {Copy-Item -LiteralPath $PlayerData -Destination $data -Recurse}
 if ($WarmCache) {Copy-Item -LiteralPath $WarmCache -Destination $cache -Recurse}
 else {New-Item -ItemType Directory -Path $cache | Out-Null}
 $prior=@{}
@@ -50,7 +54,7 @@ try {
     $env:VICTORY_GAME_DIR=Split-Path $game
     $env:VICTORY_CACHE_DIR=$cache
     $env:VICTORY_DATA_DIR=$data
-    $env:VICTORY_CAPTURE=$frames
+    if(!$PlaySession){$env:VICTORY_CAPTURE=$frames}
     $env:VICTORY_PHYSICAL_BACKING_DIR=Join-Path $out 'guest-pages'
     $p=Start-Process -FilePath $exe -ArgumentList @('run',('"'+$game+'"'),'--execute') -WorkingDirectory $work -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $out 'stdout.log') -RedirectStandardError (Join-Path $out 'stderr.log')
     [WorldMemory]::LimitResidentMemory($p.Handle,16)
@@ -86,7 +90,7 @@ try {
         if ($m[1]-$m[0] -lt 1.5GB) {$state.outcome='commit-guard';break}
         if ($m[2] -lt 2GB) {$state.outcome='physical-memory-guard';break}
         if (Test-Path -LiteralPath (Join-Path $out 'scene-reviewed.stop')) {$state.outcome='scene-reviewed';break}
-        if ($timer.Elapsed.TotalSeconds -ge $Seconds) {$state.outcome='duration';break}
+        if (!$PlaySession -and $timer.Elapsed.TotalSeconds -ge $Seconds) {$state.outcome='duration';break}
         Start-Sleep -Milliseconds 200
     }
     if ($state.outcome -eq 'running') {$state.outcome='application-exit'}

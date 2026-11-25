@@ -751,6 +751,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-prepare-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "memchr",
+ "tracing",
+ "victory-game",
+ "victory-pipeline",
+ "victory-shader",
+ "windows",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
