@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+mod parallel_prepare;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -6941,7 +6943,18 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let copies = &self.deferred().copies;
+        let mut cursor = 0;
+        while cursor < copies.len() {
+            if cursor == 0 || !parallel_prepare::eligible(&copies[cursor - 1]) {
+                let consumed = parallel_prepare::run(&copies[cursor..], batch);
+                if consumed != 0 {
+                    cursor += consumed;
+                    continue;
+                }
+            }
+            let step = &copies[cursor];
+            cursor += 1;
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {

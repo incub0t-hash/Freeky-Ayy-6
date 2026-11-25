@@ -3465,6 +3465,16 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Owned CPU storage for submission preparation. Placed resources can
+    /// alias title memory and must stay on the serial preparation path.
+    pub(crate) fn preparation_storage(&self) -> Option<(usize, usize)> {
+        if self.place.is_some() {
+            return None;
+        }
+        let start = self.data as usize;
+        Some((start, start.checked_add(usize::try_from(self.len).ok()?)?))
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
