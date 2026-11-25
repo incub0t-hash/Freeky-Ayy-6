@@ -757,6 +757,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "memchr",
+ "tempfile",
  "tracing",
  "victory-game",
  "victory-pipeline",

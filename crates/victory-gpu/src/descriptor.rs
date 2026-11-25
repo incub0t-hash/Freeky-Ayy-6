@@ -1248,9 +1248,12 @@ pub(crate) mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // Placed buffer SRVs and UAVs both encode their address inline.
+        // Distinctive words keep this test's shape counts local to its views.
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        resource[0] = 1; // BUFFER
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        desc[1] = 1; // BUFFER for both SRVs and UAVs
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,

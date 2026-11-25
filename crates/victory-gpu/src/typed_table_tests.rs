@@ -80,13 +80,20 @@ fn relocated_typed_uavs_follow_view_offsets_and_recorded_lifetime() {
     assert_eq!(mask(&state, second), 1);
     assert_eq!(mask(&state, first), 2);
 
-    // A compatible placed texture UAV reuses the named integer target.
     let mut placed = [0u32; 16];
     placed[0] = 42;
     placed[1] = 4;
     placed[10] = address as u32;
     placed[11] = (address >> 32) as u32;
     guest.0[8] = 42;
+    // A placed view past the only mip binds a null UAV and leaves its bit clear.
+    let mut past_last_mip = placed;
+    past_last_mip[2] = 1;
+    descriptor::create_placed_uav(null, &guest.0, &past_last_mip, root + 96);
+    let rejected = bind(&mut state)[0].1;
+    assert_eq!(mask(&state, rejected), 1);
+
+    // A compatible placed texture UAV reuses the named integer target.
     descriptor::create_placed_uav(null, &guest.0, &placed, root + 96);
     let third = bind(&mut state)[0].1;
     assert_eq!(mask(&state, third), 3);
