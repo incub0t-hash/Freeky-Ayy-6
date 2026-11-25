@@ -422,7 +422,24 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // A pool confined to the efficiency cores must not still size itself
+        // for every logical processor. Leave the performance cores to the
+        // title and avoid two decompression workers per efficiency core.
+        #[cfg(windows)]
+        let preferred = if disk_efficiency_cores() {
+            let slow = victory_gpu::framelog::slow_processors().count_ones() as usize;
+            if slow >= 8 { slow } else { available }
+        } else {
+            available
+        };
+        #[cfg(not(windows))]
+        let preferred = available;
+        let workers = std::env::var("VICTORY_DISK_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= available)
+            .unwrap_or(preferred);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -431,7 +448,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, available, preferred, "dstorage: workers");
     });
     Some(scheduler)
 }
@@ -488,6 +505,13 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     );
 }
 
+/// Whether asset-loading workers use the efficiency-core group.
+#[cfg(windows)]
+fn disk_efficiency_cores() -> bool {
+    static SLOW: OnceLock<bool> = OnceLock::new();
+    *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow"))
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
@@ -495,8 +519,7 @@ fn work(scheduler: &'static Scheduler) {
     // default until it is measured).
     #[cfg(windows)]
     {
-        static SLOW: OnceLock<bool> = OnceLock::new();
-        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+        if disk_efficiency_cores() {
             victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
         }
     }
