@@ -1503,9 +1503,20 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let default = (available / 4).clamp(2, 6);
+        let n = std::env::var("VICTORY_MEMORY_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= available.saturating_sub(1).max(1))
+            .unwrap_or(default);
+        let fast = std::env::var_os("VICTORY_MEMORY_FAST_CORES").is_some_and(|v| v == "1");
+        tracing::info!(workers = n, available, fast, "memory preparation worker pool");
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                if fast {
+                    crate::framelog::keep_on_fast_cores("victory-wide");
+                }
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
