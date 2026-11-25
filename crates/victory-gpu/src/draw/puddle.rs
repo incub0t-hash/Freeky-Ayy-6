@@ -8,11 +8,42 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 
 const MATERIAL_BYTES: usize = 16;
 
+fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PUDDLE_TRACE").is_some_and(|v| v == "1"))
+}
+
+pub(super) fn size_trace(hash: &str) -> Option<u64> {
+    enabled().then(|| u64::from_str_radix(hash, 16).ok()).flatten()
+}
+
+/// Sample each shader and outcome independently, so frequent successful
+/// submissions never mask a refusal. No per-frame allocation or heap scan.
+pub(super) fn size_outcome(shader: u64, status: &'static str, index: Option<u32>, packed: u32) {
+    use std::{collections::BTreeMap, sync::Mutex};
+    static COUNTS: Mutex<BTreeMap<(u64, &'static str), u64>> = Mutex::new(BTreeMap::new());
+    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (shader, status);
+    if counts.len() == 128 && !counts.contains_key(&key) {
+        return;
+    }
+    let entry = counts.entry(key).or_default();
+    *entry += 1;
+    let sample = *entry;
+    drop(counts);
+    if sample > 4 && !sample.is_power_of_two() {
+        return;
+    }
+    let bits = !packed;
+    let size = (packed != 0).then(|| ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1, bits >> 28));
+    tracing::info!(shader = format_args!("{shader:016x}"), frame = crate::frame::current(),
+        status, sample, ?index, width_height_base_mip = ?size, "native size binding");
+}
+
 impl State {
     pub(super) fn observe_puddle(&self, list: &HostList, draw: &'static str) {
-        static ON: OnceLock<bool> = OnceLock::new();
         static SAMPLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PUDDLE_TRACE").is_some_and(|v| v == "1")) {
+        if !enabled() {
             return;
         }
         let Some((which, shader)) = crate::pipeline::puddle_shader(self.pipeline as This) else {

@@ -711,6 +711,10 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_IMAGE_SIZE {
+            // Its slot and offset describe the private image-size SRV binding.
+            return 0;
+        }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
             // (`root_uav`, `root_srv_table`).
@@ -762,6 +766,55 @@ impl State {
             }
         }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
+    }
+
+    /// Capture the shader's proven uniform CBV selector at submission.
+    /// Freeze its slot and actual view dimensions until GPU completion.
+    pub(crate) fn bind_image_size(&self, list: &HostList, user: &[victory_shader::emit::UserData],
+        #[cfg(feature = "diagnostics")] trace: Option<u64>) -> Option<u64> {
+        use crate::descriptor::observation;
+        let input = user.iter().find(|u| {
+            u.root == RootType::Other(victory_shader::emit::USER_IMAGE_SIZE)
+        })?;
+        let Root::Table(table) = self.graphics.get(usize::from(input.slot))? else {
+            return None;
+        };
+        let heap = observation::bound_heap(self.heaps[0])?;
+        let handle = heap.table_entry(*table, input.dword >> 8)?;
+        let (key, View::Constant(address, size)) = observation::view(handle)? else {
+            return None;
+        };
+        let offset = (input.dword & 255) * 4;
+        if address == 0 || offset + 4 > size {
+            return None;
+        }
+        let address = address.checked_add(u64::from(offset))?;
+        address.checked_add(4)?;
+        let (gpu, to) = list.scratch(8)?;
+        // SAFETY: the list just allocated these eight aligned bytes for this draw.
+        unsafe { to.cast::<u64>().write(0) };
+        list.defer_fill(to, address as *const u8, 4);
+        let destination = to as usize;
+        list.defer_host(move || {
+            // SAFETY: both aligned dwords belong to the list through completion.
+            let words = destination as *mut u32;
+            let index = unsafe { words.read() };
+            let mut source = [0; 4];
+            let valid = crate::host::read_into(address as *const u8, &mut source)
+                && u32::from_le_bytes(source) == index
+                && observation::view(handle).is_some_and(|(current, _)| current == key);
+            let packed = valid.then(|| heap.image_size(index)).flatten().unwrap_or(0);
+            // SAFETY: the second dword of the same upload allocation.
+            unsafe { words.add(1).write(packed) };
+            #[cfg(feature = "diagnostics")]
+            if let Some(shader) = trace {
+                let status = if !valid { "material changed or unavailable" }
+                    else if packed == 0 { "view unavailable or unsupported" }
+                    else { "resolved at submission" };
+                puddle::size_outcome(shader, status, Some(index), packed);
+            }
+        });
+        Some(gpu)
     }
 
     /// The bound heap holding `handle`.
@@ -987,6 +1040,21 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_IMAGE_SIZE {
+                        #[cfg(feature = "diagnostics")]
+                        let trace = puddle::size_trace(&stage.shader.hash);
+                        let Some(gpu) = self.bind_image_size(list, &t.host.user_data,
+                            #[cfg(feature = "diagnostics")] trace) else {
+                            #[cfg(feature = "diagnostics")]
+                            if let Some(shader) = trace {
+                                puddle::size_outcome(shader, "binding missing at recording", None, 0);
+                            }
+                            return false;
+                        };
+                        // SAFETY: a pixel-only root SRV of two dwords in list-held memory.
+                        unsafe { l.SetGraphicsRootShaderResourceView(param, gpu) };
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -1486,8 +1554,17 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        // The public texture-queue switches let a slow scene spend more of
+        // each frame staging outstanding texture views.
+        static BUDGET: std::sync::OnceLock<(u64, std::time::Duration)> = std::sync::OnceLock::new();
+        let &(per_frame, span) = BUDGET.get_or_init(|| {
+            let read = |name: &str| std::env::var(name).ok()?.trim().parse::<u64>().ok();
+            let bytes = read("VICTORY_TEXTURE_QUEUE_MB")
+                .and_then(|mb| mb.checked_mul(1 << 20))
+                .unwrap_or(192 << 20);
+            let ms = read("VICTORY_TEXTURE_QUEUE_MS").unwrap_or(250);
+            (bytes, std::time::Duration::from_millis(ms))
+        });
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1540,10 +1617,9 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1603,7 +1679,7 @@ impl State {
             }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
-            let resource = match placed.as_ref().or(view.as_ref()) {
+            let resource = match placed.as_ref().map(|p| &p.0).or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
                     host.texture_slot_done(index, write, None);
@@ -2641,7 +2717,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    let view = placed.as_ref().map_or(view, |p| &p.0);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
@@ -2666,7 +2742,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.0));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)

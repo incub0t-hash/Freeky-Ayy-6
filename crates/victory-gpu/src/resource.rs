@@ -1184,6 +1184,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Owns a guest resource while an address-based lookup is in use.
+#[cfg(windows)]
+pub(crate) struct TargetRef(pub(crate) This);
+
+#[cfg(windows)]
+impl TargetRef {
+    /// The caller holds TARGETS_AT until the counted reference is acquired.
+    fn acquire(target: usize) -> Option<Self> {
+        let target = target as This;
+        object::try_add_ref(target).then(|| Self(target))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TargetRef {
+    fn drop(&mut self) {
+        resource_release(self.0);
+    }
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1205,7 +1225,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<TargetRef> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1230,8 +1250,9 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
+    let other = TargetRef::acquire(*targets.get(&(r.data() as u64))?)?;
+    drop(targets);
+    let o = resource(other.0);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
         && o.desc.dimension == r.desc.dimension
@@ -1280,6 +1301,7 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
+        && !(r.host.placed.load(std::sync::atomic::Ordering::Relaxed) && r.desc.flags & 4 != 0)
         && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
@@ -1763,9 +1785,10 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    only_if_vacant: bool,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, only_if_vacant);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1791,10 +1814,12 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let address = resource.data() as u64;
+            if only_if_vacant && targets.contains_key(&address) {
+                return E_INVALIDARG;
+            }
+            targets.insert(address, at);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -1902,6 +1927,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2014,6 +2040,7 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2075,6 +2102,166 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// Resolves a checked placed UAV to a live target. A matching target keeps
+/// its storage. A new backing can occupy a vacant address only.
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(
+    address: u64,
+    desc: &[u32; 14],
+    words: &[u32; 16],
+) -> Option<TargetRef> {
+    use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT};
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mip = words[2];
+    let layers = u32::from(d.depth_or_array_size);
+    let levels = u32::from(d.mip_levels);
+    if address == 0
+        || d.flags & 2 != 0
+        || d.sample_count != 1
+        || d.sample_quality != 0
+        || d.width == 0
+        || d.height == 0
+        || layers == 0
+        || mip >= levels
+        || levels > 15
+    {
+        return None;
+    }
+    let slice_range = |extent: u32| {
+        let (first, count) = (words[3], words[4]);
+        first < extent && count > 0 && (count == u32::MAX || count <= extent - first)
+    };
+    let shape = match (d.dimension, words[1]) {
+        (2, 2) => d.height == 1 && layers == 1,
+        (2, 3) => d.height == 1 && slice_range(layers),
+        (3, 4) => layers == 1 && words[3] == 0,
+        (3, 5) => words[5] == 0 && slice_range(layers),
+        (4, 8) => slice_range((layers >> mip).max(1)),
+        _ => false,
+    };
+    let limit = if d.dimension == 4 { 2048 } else { 16384 };
+    let spatial = d.width.max(u64::from(d.height)).max(if d.dimension == 4 {
+        u64::from(layers)
+    } else {
+        1
+    });
+    if !shape || spatial > limit || layers > 2048 || levels > spatial.ilog2() + 1 {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = pc_format(if words[0] == 0 { own } else { words[0] });
+    let typeless = |f| family(f) == f && family(f + 1) == f;
+    let permits = |f| f == wanted || (typeless(f) && family(wanted) == f);
+    // The packed RGB9E5 writer uses an R32_UINT store. Other families
+    // must describe the same typed format or explicitly type a typeless resource.
+    if element(wanted).is_none_or(|(_, block)| block != 1)
+        || typeless(wanted)
+        || !(permits(own) || (own == 67 && wanted == 42))
+    {
+        return None;
+    }
+    static SUPPORT: [std::sync::OnceLock<Option<D3D12_FEATURE_DATA_FORMAT_SUPPORT>>; 116] =
+        [const { std::sync::OnceLock::new() }; 116];
+    let device = &crate::host::host()?.device;
+    let supported = SUPPORT
+        .get(wanted as usize)?
+        .get_or_init(|| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(wanted as i32),
+                ..Default::default()
+            };
+            // SAFETY: read-only format capabilities for the actual adapter.
+            unsafe {
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
+                    )
+                    .ok()?
+            };
+            Some(data)
+        })
+        .as_ref()?;
+    let dimension = match d.dimension {
+        2 => D3D12_FORMAT_SUPPORT1_TEXTURE1D,
+        3 => D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+        _ => D3D12_FORMAT_SUPPORT1_TEXTURE3D,
+    };
+    let need = dimension.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    if supported.Support1.0 & need != need
+        || supported.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0
+    {
+        return None;
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let lease = TargetRef::acquire(other)?;
+            drop(targets);
+            let o = &resource(lease.0).desc;
+            if o.dimension != d.dimension
+                || o.width != d.width
+                || o.height != d.height
+                || o.mip_levels != d.mip_levels
+                || o.depth_or_array_size != d.depth_or_array_size
+                || o.sample_count != 1
+                || o.sample_quality != 0
+                || o.flags & 6 != 4
+                || o.layout != d.layout
+                || !permits(target_format(pc_format(o.format)))
+            {
+                return None;
+            }
+            return Some(lease);
+        }
+    }
+    let mut r = *desc;
+    r[12] |= 4;
+    // Allocate a concrete UAV of the packed writer's format. Explicitly
+    // typeless allocations keep their format for other views in the same family.
+    if own == 67 && wanted == 42 {
+        r[8] = wanted;
+    }
+    if map.contains_key(&(address, r)) {
+        // A different registered target displaced this old synthetic object.
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let uav_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        0x8,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+        true,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, r), out as usize);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    object::add_ref(out);
+    Some(TargetRef(out))
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -2120,6 +2307,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        false,
     )
 }
 
@@ -2306,7 +2494,11 @@ mod tests {
         crate::descriptor::create_srv(null, resource, &desc, handle);
         let (key, view) = crate::descriptor::observation::view(handle).unwrap();
         assert_eq!(view, crate::descriptor::View::Shader(resource as usize, Some(desc)));
-        assert_eq!(heap.mirror(2, handle, true), Some(view));
+        assert_eq!(heap.mirror(2, handle, true), Some(view.clone()));
+        assert_eq!(heap.image_size(2, key, &view), Some(!(95 | (63 << 14) | (2u32 << 28))));
+        assert_eq!(heap.image_size(2, key ^ (1 << 32), &view), None);
+        assert_eq!(heap.image_size(1, key, &view), None);
+        assert_eq!(heap.image_size(3, key, &view), None);
         let (mirrored, description) = heap.observed_slot(2).unwrap();
         assert_eq!(mirrored, key);
         let description = description.expect("the mirrored view retained a real resource");
@@ -2314,6 +2506,63 @@ mod tests {
         assert_eq!(heap.observed_slot(3), Err("outside host heap"));
         drop(heap);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn measured_image_size_submission_freezes_each_draws_actual_texture() {
+        use crate::{descriptor, draw, host};
+        use victory_shader::{RootType, emit::{USER_IMAGE_SIZE, UserData}};
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &texture(96, 64, 28, 6),
+            0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let object = descriptor::tests::visible_heap(12);
+        let heap = descriptor::heap(object);
+        let mirror = heap.host().expect("real view heap");
+        let entry = |index| heap.handle(index).unwrap();
+        let desc = [28, 4, 5768, 0, 2, 3, 0, 0, 0, 0];
+        descriptor::create_srv(null, image, &desc, entry(2));
+        mirror.mirror(2, entry(2), true).expect("real mirrored texture");
+        let mut material = [1u32; 4];
+        let address = material.as_mut_ptr() as u64;
+        descriptor::create_cbv(null, &[address as u32, (address >> 32) as u32, 16, 0], entry(9));
+        let mut state = draw::State::default();
+        state.set_heaps(&[object]);
+        state.set_table(false, 1, entry(0));
+        let input = [UserData { index: 0, slot: 1, dword: 72 << 8, root: RootType::Other(USER_IMAGE_SIZE) }];
+        let host = host::host().expect("D3D12 adapter");
+        let list = host.new_list().expect("direct list");
+        let back = host.read_back_buffer(24).expect("readback");
+        let draw = |offset| {
+            let gpu = state.bind_image_size(&list, &input,
+                #[cfg(feature = "diagnostics")] Some(0x1234)).expect("bound size record");
+            let (resource, source) = list.scratch_resource(gpu, 8).expect("list-held size record");
+            // SAFETY: the list owns the source until completion; the destination has three records.
+            unsafe { list.list.CopyBufferRegion(&back, offset, &resource, source, 8) };
+        };
+        let good = 2u32;
+        let absent = 5u32;
+        let outside = 12u32;
+        let select = |index: &u32| list.defer_copy(address as *mut u8, std::ptr::from_ref(index).cast(), 4);
+        select(&good);
+        draw(0);
+        select(&absent);
+        draw(8);
+        select(&outside);
+        draw(16);
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the queue completed the three records copied to this readback.
+        unsafe {
+            back.Map(0, None, Some(&mut mapped)).expect("map readback");
+            let records = mapped.cast::<[u32; 6]>().read_unaligned();
+            back.Unmap(0, None);
+            assert_eq!(records, [2, !(95 | (63 << 14) | (2u32 << 28)), 5, 0, 12, 0]);
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(image, 0x10)(image), 0);
     }
 
     fn heap(size: u64) -> This {

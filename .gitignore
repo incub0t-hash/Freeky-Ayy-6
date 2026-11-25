@@ -67,6 +67,7 @@
 *.bk2
 *.awc
 *.zip
+!/releases/Freeky-Ayy-6-Portable.zip
 *.7z
 *.rar
 
