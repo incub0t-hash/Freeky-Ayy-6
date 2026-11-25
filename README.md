@@ -16,7 +16,7 @@ The reference interval contains 16 presented frames over 14.84 seconds, approxim
 
 ## Portable runtime
 
-The GitHub release ZIP includes the original renderer binary, a shader-cache preparation binary, checkpoint, settings, launch and memory monitoring tools, Microsoft's signed x64 C++ runtime installer, source history with 59 research branches, local source patches and file checksums.
+The [portable ZIP](releases/Freeky-Ayy-6-Portable.zip) includes the original renderer binary, a shader-cache preparation binary, checkpoint, settings, launch and memory monitoring tools, Microsoft's signed x64 C++ runtime installer, source history with 59 research branches, local source patches and file checksums.
 
 Extract the ZIP and drag your own game executable onto `Play.cmd`. The first launch prepares the reference shaders from your game files. See [portable instructions](tools/portable/README.md).
 
